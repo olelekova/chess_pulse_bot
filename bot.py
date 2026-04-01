@@ -405,6 +405,8 @@ async def get_opening_analysis(game_data: dict, opening_info: dict,
 # ─── TELEGRAM ─────────────────────────────────────────────────
 async def send_update(bot: Bot, message: str):
     """Отправить сообщение. При ошибке Markdown — повторить без форматирования."""
+    # Telegram text max = 4096 символов
+    message = message[:4090] + "…" if len(message) > 4096 else message
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
     except Exception as e:
@@ -420,11 +422,13 @@ async def send_update_with_photo(bot: Bot, message: str, pgn: str):
     """Отправить сообщение с изображением доски. При ошибке — текст без картинки."""
     png = get_board_png(pgn)
     if png:
+        # Telegram caption max = 1024 символа
+        caption = message[:1020] + "…" if len(message) > 1024 else message
         try:
             await bot.send_photo(
                 chat_id=TELEGRAM_CHAT_ID,
                 photo=png,
-                caption=message,
+                caption=caption,
                 parse_mode="Markdown"
             )
             return
@@ -506,18 +510,20 @@ async def get_round_preview(pairs: list[tuple[str, str]]) -> str:
 Пары тура:
 {pairs_text}
 
-Для каждой партии напиши строго в таком формате (одна строка на партию, без пустых строк между ними):
+Для каждой партии напиши строго в таком формате (одна строка на партию):
 
-*Белый – Чёрный*: N побед белого / N ничьих / N побед чёрного в классике. [Факт] — [Прогноз]
+*Белый – Чёрный*: X:Y. [Факт] — [Прогноз]
+
+Где X:Y — общий шахматный счёт в классических OTB партиях: победа = 1 очко, ничья = 0.5.
+Примеры: "3:2.5", "1.5:0.5", "0:1", "первая встреча"
 
 Правила:
-- Счёт всегда в формате "X побед белого / Y ничьих / Z побед чёрного" — например: "3 победы белого / 5 ничьих / 2 победы чёрного"
-- Если классических партий мало (меньше 3) или это первая встреча — пиши "первая встреча" или "всего X классических партий" вместо счёта
-- Данные ОБЯЗАТЕЛЬНО для всех 4 пар — не пропускай ни одну
-- Если точный счёт неизвестен — дай приблизительный с пометкой "около"
-- Факт: один конкретный — дебютная специализация, характерный результат, или особенность стиля
-- Прогноз: 1 предложение — острая борьба, позиционная игра, теоретическая дуэль
-- Только реальные факты из шахматных баз
+- Счёт ВСЕГДА в формате X:Y через двоеточие, только цифры — никаких слов
+- Если встреч мало или нет — "первая встреча" или "N партий: X:Y"
+- Данные ОБЯЗАТЕЛЬНО для всех 4 пар
+- Факт: дебютная специализация, характерный результат, особенность стиля — одно предложение
+- Прогноз: острая борьба / позиционная игра / теоретическая дуэль — одно предложение
+- Только реальные факты
 - Не упоминай что ты ИИ
 - Никаких заголовков — только 4 строки"""
 
@@ -557,7 +563,7 @@ async def send_round_start(bot: Bot, round_name: str, games_pgn: list[str]):
            f"_{today}_"
            f"{time_line}\n"
            f"Пары тура:\n{pairs_lines}\n\n"
-           f"📊 *История встреч и прогноз:*\n{preview}\n\n"
+           f"📊 *История встреч в классике:*\n{preview}\n\n"
            f"Слежу за всеми партиями 📡")
     await send_update(bot, msg)
 
@@ -655,11 +661,7 @@ async def main():
                 if event_type:
                     commentary = get_gm_commentary(game_data, eval_data, event_type)
                     msg = format_event_msg(game_data, eval_data, event_type, commentary)
-                    # Для резких изменений и конца партии — с картинкой
-                    if event_type in ("eval_swing", "game_over"):
-                        await send_update_with_photo(bot, msg, pgn)
-                    else:
-                        await send_update(bot, msg)
+                    await send_update_with_photo(bot, msg, pgn)
 
                 seen_games[game_id] = eval_data
 
