@@ -464,7 +464,8 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str) -> str:
 Событие: {event_desc}
 
 Напиши 3–4 предложения в стиле: конкретный факт о позиции → твоя оценка ситуации с мнением → прогноз или интрига.
-Пиши уверенно, можно с лёгкой иронией. Называй игроков по фамилии. Не упоминай что ты ИИ."""
+Пиши уверенно, можно с лёгкой иронией. Называй игроков по фамилии. Не упоминай что ты ИИ.
+Без заголовков, списков и markdown-форматирования. Только обычный текст."""
         max_tokens = 350
 
     else:
@@ -481,7 +482,8 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str) -> str:
 Событие: {event_desc}
 
 Напиши 2–3 коротких фактических предложения: что происходит на доске и почему это важно.
-Никакой воды, только конкретика. Называй игроков по фамилии. Не упоминай что ты ИИ."""
+Никакой воды, только конкретика. Называй игроков по фамилии. Не упоминай что ты ИИ.
+Без заголовков, списков и markdown-форматирования. Только обычный текст."""
         max_tokens = 220
 
     r = client.messages.create(
@@ -507,14 +509,11 @@ async def get_opening_analysis(game_data: dict, opening_info: dict,
 Репертуар {white} за белых: {', '.join(white_rep[:10]) or 'нет данных'}
 Репертуар {black} за чёрных: {', '.join(black_rep[:10]) or 'нет данных'}
 
-4-6 предложений в прямом эфире:
-1. В репертуаре ли этот дебют у каждого игрока?
-2. Кто скорее всего был удивлён — и почему?
-3. Что говорит расход времени о том, кто думал в дебюте?
-Не упоминай что ты ИИ."""
+3 предложения максимум: свой ли дебют для каждого, кто выглядит увереннее и что говорит расход времени.
+Никакой воды. Пиши по-русски, без заголовков, без списков, без markdown-форматирования. Только обычный текст. Не упоминай что ты ИИ."""
 
     r = client.messages.create(
-        model="claude-sonnet-4-6", max_tokens=500,
+        model="claude-sonnet-4-6", max_tokens=280,
         messages=[{"role": "user", "content": prompt}]
     )
     return r.content[0].text
@@ -704,11 +703,11 @@ async def send_15min_status(bot: Bot, game_data: dict, pgn: str):
     bt = info.get("black_time_remaining", "—")
 
     msg = (f"🕐 *{white} — {black}* | 15 минут\n"
-           f"Дебют: *{opening}*{eco}\n"
+           f"Дебют: {opening}{eco}\n"
            f"Ходы: `{moves}`\n"
            f"⏱ {white}: {wt} | {black}: {bt}\n\n"
-           f"🧠 *Анализ дебюта:*\n{analysis}")
-    await send_update(bot, msg)
+           f"🧠 {analysis}")
+    await send_update_with_photo(bot, msg, pgn)
 
 
 def format_event_msg(game_data: dict, eval_data: dict, event_type: str,
