@@ -278,6 +278,87 @@ def extract_opening_info(pgn_text: str) -> dict:
     return result
 
 
+def analyze_clocks(pgn_text: str) -> dict:
+    """Анализ часов: остаток времени у каждого игрока + самый долгий ход.
+    Учитывает инкремент из заголовка TimeControl (например 7200+30)."""
+    try:
+        game = chess.pgn.read_game(io.StringIO(pgn_text))
+        if not game:
+            return {}
+
+        # Инкремент из TimeControl (ФИДЕ Кандидаты: 7200+30)
+        tc = game.headers.get("TimeControl", "7200+30")
+        try:
+            parts = tc.split("+")
+            initial = float(parts[0])
+            increment = float(parts[1]) if len(parts) > 1 else 0.0
+        except Exception:
+            initial, increment = 7200.0, 30.0
+
+        def fmt(secs):
+            if secs is None or secs < 0:
+                return "?"
+            secs = int(secs)
+            h, rem = divmod(secs, 3600)
+            m, s = divmod(rem, 60)
+            return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+        # Собираем ходы с часами
+        node = game
+        white_clocks, black_clocks = [], []   # остаток после хода (секунды)
+        move_sans = []
+        while node.variations:
+            node = node.variations[0]
+            clk = node.clock()   # секунды остатка или None
+            move_sans.append(node.san())
+            if len(move_sans) % 2 == 1:
+                white_clocks.append(clk)
+            else:
+                black_clocks.append(clk)
+
+        # Текущий остаток
+        white_rem = white_clocks[-1] if white_clocks else None
+        black_rem = black_clocks[-1] if black_clocks else None
+
+        # Самый долгий ход (с учётом инкремента: потрачено = prev + inc - current)
+        longest_secs = 0
+        longest = None
+
+        prev_w = initial
+        for i, clk in enumerate(white_clocks):
+            if clk is not None and prev_w is not None:
+                spent = prev_w + increment - clk
+                if spent > longest_secs:
+                    longest_secs = spent
+                    san = move_sans[i * 2] if i * 2 < len(move_sans) else "?"
+                    longest = {"move_num": i + 1, "san": san,
+                               "color": "white", "secs": spent}
+            if clk is not None:
+                prev_w = clk
+
+        prev_b = initial
+        for i, clk in enumerate(black_clocks):
+            if clk is not None and prev_b is not None:
+                spent = prev_b + increment - clk
+                if spent > longest_secs:
+                    longest_secs = spent
+                    san = move_sans[i * 2 + 1] if i * 2 + 1 < len(move_sans) else "?"
+                    longest = {"move_num": i + 1, "san": san,
+                               "color": "black", "secs": spent}
+            if clk is not None:
+                prev_b = clk
+
+        return {
+            "white_rem": fmt(white_rem),
+            "black_rem": fmt(black_rem),
+            "longest": longest,
+            "longest_str": fmt(longest_secs) if longest else None,
+        }
+    except Exception as e:
+        print(f"Clock analysis error: {e}")
+        return {}
+
+
 def get_board_png(pgn_text: str) -> bytes | None:
     """Сгенерировать PNG изображение доски из PGN."""
     try:
@@ -630,14 +711,31 @@ async def send_15min_status(bot: Bot, game_data: dict, pgn: str):
     await send_update(bot, msg)
 
 
-def format_event_msg(game_data: dict, eval_data: dict, event_type: str, commentary: str) -> str:
+def format_event_msg(game_data: dict, eval_data: dict, event_type: str,
+                     commentary: str, clock_info: dict | None = None) -> str:
     w = game_data["white"]["username"]
     b = game_data["black"]["username"]
-    icons = {"eval_swing": "📈", "novelty": "🔬", "game_over": "🏁", "new_game": "♟️"}
+    icons = {"eval_swing": "📈", "game_over": "🏁", "new_game": "♟️"}
+
+    # Строка часов — всегда
+    clock_line = ""
+    if clock_info:
+        wr = clock_info.get("white_rem", "?")
+        br = clock_info.get("black_rem", "?")
+        clock_line = f"\n⏱ {w}: `{wr}` | {b}: `{br}`"
+
+        # Долгий ход — только для ключевых событий
+        if event_type in ("eval_swing", "game_over") and clock_info.get("longest"):
+            lt = clock_info["longest"]
+            thinker = w if lt["color"] == "white" else b
+            clock_line += (f"\n🤔 Дольше всего думал: *{thinker}* — "
+                           f"ход {lt['move_num']}. {lt['san']} ({clock_info['longest_str']})")
+
     return (f"{icons.get(event_type,'♟️')} *{w} — {b}*\n"
             f"Ход {eval_data['move_count']} | Оценка: `{eval_data['eval_str']}` | "
-            f"Лучший ход: `{eval_data['best_move']}`\n\n"
-            f"🧠 *Комментарий гроссмейстера:*\n{commentary}")
+            f"Лучший: `{eval_data['best_move']}`"
+            f"{clock_line}\n\n"
+            f"🧠 {commentary}")
 
 
 # ─── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────
@@ -705,7 +803,8 @@ async def main():
 
                 if event_type:
                     commentary = get_gm_commentary(game_data, eval_data, event_type)
-                    msg = format_event_msg(game_data, eval_data, event_type, commentary)
+                    clock_info = analyze_clocks(pgn)
+                    msg = format_event_msg(game_data, eval_data, event_type, commentary, clock_info)
                     await send_update_with_photo(bot, msg, pgn)
 
                 seen_games[game_id] = eval_data
