@@ -109,6 +109,11 @@ async def get_active_round_id() -> tuple[str | None, str | None]:
                     games = split_pgn(r.text)
                     if not games:
                         continue
+                    # Раунд считается начавшимся только если есть ходы хотя бы в одной партии
+                    started = [g for g in games if count_moves_pgn(g) > 0]
+                    if not started:
+                        print(f"{rname} ({rid}): {len(games)} партий, ещё не началось")
+                        continue
                     finished_count = sum(1 for g in games if is_game_finished(g))
                     print(f"{rname} ({rid}): {len(games)} партий, {finished_count} завершено")
                     # Раунд активен если хотя бы одна партия ещё не завершена

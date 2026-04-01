@@ -21,7 +21,7 @@ git config user.name "Chess Bot"
 
 # Коммит и пуш
 git add bot.py Dockerfile requirements.txt render.yaml push.sh
-git commit -m "Add board images (cairosvg), fix H2H format, all 14 round IDs, fix moves_san crash, PGN round detection"
+git commit -m "Fix round detection: skip future rounds without moves; PYTHONUNBUFFERED for logs"
 git push --force origin main
 
 echo "✅ Готово! Render задеплоит автоматически."
