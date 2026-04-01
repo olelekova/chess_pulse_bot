@@ -1,0 +1,624 @@
+"""
+Chess Candidates 2026 — Telegram Bot
+Данные: Lichess Broadcast API (OTB турнир)
+Stockfish оценка + Claude комментарий на русском
+"""
+
+import asyncio
+import os
+import time
+import datetime
+import re
+import io
+import chess
+import chess.engine
+import chess.pgn
+import httpx
+from telegram import Bot
+from anthropic import Anthropic
+
+# ─── НАСТРОЙКИ ────────────────────────────────────────────────
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+STOCKFISH_PATH    = os.environ.get("STOCKFISH_PATH", "/usr/games/stockfish")
+
+POLL_INTERVAL_SECONDS = 300    # проверять каждые 5 минут
+EVAL_SWING_THRESHOLD  = 1.2    # оповещать при изменении оценки ≥ 1.2 пешки
+NOVELTY_MOVE_THRESHOLD = 15    # сигнал если дебют кончился до хода 15
+OPENING_STATUS_DELAY  = 900    # 15 минут до дебютного анализа
+
+# Lichess Broadcast — FIDE Candidates 2026 (серия целиком)
+LICHESS_BROADCAST_ID = "oe4JqS3R"
+
+# ID раундов Open турнира (добавлять по мере появления новых)
+# Формат URL: lichess.org/broadcast/fide-candidates-2026-open/round-N/{roundId}
+KNOWN_ROUND_IDS = [
+    ("uLCZwqAK", "Round 1"),
+    ("FRTlzP2X", "Round 2"),
+    ("SDizieNR", "Round 3"),
+    ("97di6JjX", "Round 4"),
+]
+
+# ─── РАСПИСАНИЕ ТУРНИРА ───────────────────────────────────────
+# Начало партий: 15:30 Кипр (EEST=UTC+3) = 12:30 UTC = 13:30 Лиссабон = 15:30 Москва
+# Дни отдыха: 2, 6, 10, 13 апреля
+_UTC = datetime.timezone.utc
+ROUND_SCHEDULE = {
+    "Round 1":  datetime.datetime(2026, 3, 29, 12, 30, tzinfo=_UTC),
+    "Round 2":  datetime.datetime(2026, 3, 30, 12, 30, tzinfo=_UTC),
+    "Round 3":  datetime.datetime(2026, 3, 31, 12, 30, tzinfo=_UTC),
+    "Round 4":  datetime.datetime(2026, 4,  1, 12, 30, tzinfo=_UTC),
+    "Round 5":  datetime.datetime(2026, 4,  3, 12, 30, tzinfo=_UTC),
+    "Round 6":  datetime.datetime(2026, 4,  4, 12, 30, tzinfo=_UTC),
+    "Round 7":  datetime.datetime(2026, 4,  5, 12, 30, tzinfo=_UTC),
+    "Round 8":  datetime.datetime(2026, 4,  7, 12, 30, tzinfo=_UTC),
+    "Round 9":  datetime.datetime(2026, 4,  8, 12, 30, tzinfo=_UTC),
+    "Round 10": datetime.datetime(2026, 4,  9, 12, 30, tzinfo=_UTC),
+    "Round 11": datetime.datetime(2026, 4, 11, 12, 30, tzinfo=_UTC),
+    "Round 12": datetime.datetime(2026, 4, 12, 12, 30, tzinfo=_UTC),
+    "Round 13": datetime.datetime(2026, 4, 14, 12, 30, tzinfo=_UTC),
+    "Round 14": datetime.datetime(2026, 4, 15, 12, 30, tzinfo=_UTC),
+}
+REST_DAYS = {"2026-04-02", "2026-04-06", "2026-04-10", "2026-04-13"}
+
+# Маппинг фамилий из PGN → username на chess.com для репертуара
+PLAYER_CHESS_COM = {
+    "Caruana":       "fabiano-caruana",
+    "Nakamura":      "hikaru",
+    "Giri":          "anish-giri",
+    "Praggnanandhaa": "praggnanandhaa",
+    "Sindarov":      "sindarov",
+    "Wei":           "wei-yi-cn",
+    "Esipenko":      "esipenko",
+    "Bluebaum":      "bluebaum",
+}
+
+# ─── СОСТОЯНИЕ ────────────────────────────────────────────────
+seen_games          = {}   # game_id → последний eval_data
+game_start_times    = {}   # game_id → timestamp первого обнаружения
+games_15min_done    = set()
+announced_rounds    = set()  # round_id → объявили старт тура
+round_summary_done  = set()  # round_id → уже отправили итог тура
+
+# ─── LICHESS API ──────────────────────────────────────────────
+async def get_active_round_id() -> tuple[str | None, str | None]:
+    """Найти активный раунд Open турнира. Проверяем KNOWN_ROUND_IDS напрямую — это надёжнее
+    чем мета-трансляция oe4JqS3R которая возвращает смешанные ID."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        # Шаг 1: проверяем известные раунды от последнего к первому
+        for rid, rname in reversed(KNOWN_ROUND_IDS):
+            try:
+                r = await client.get(
+                    f"https://lichess.org/api/broadcast/round/{rid}",
+                    headers={"User-Agent": "CandidatesBot/1.0", "Accept": "application/json"}
+                )
+                if r.status_code == 200:
+                    rd = r.json()
+                    ongoing  = rd.get("ongoing", False)
+                    finished = rd.get("finished", False)
+                    print(f"Round {rname} ({rid}): ongoing={ongoing} finished={finished}")
+                    if ongoing or not finished:
+                        return rid, rname
+            except Exception as e:
+                print(f"Ошибка проверки раунда {rid}: {e}")
+
+        # Шаг 2: fallback — мета-трансляция серии
+        try:
+            r = await client.get(
+                f"https://lichess.org/api/broadcast/{LICHESS_BROADCAST_ID}",
+                headers={"User-Agent": "CandidatesBot/1.0", "Accept": "application/json"}
+            )
+            if r.status_code == 200:
+                rounds = r.json().get("rounds", [])
+                for rd in rounds:
+                    if rd.get("ongoing"):
+                        return rd["id"], rd.get("name", "Раунд")
+                not_finished = [rd for rd in rounds if not rd.get("finished")]
+                if not_finished:
+                    rd = not_finished[-1]
+                    return rd["id"], rd.get("name", "Раунд")
+        except Exception as e:
+            print(f"Lichess series API error: {e}")
+
+    # Последний резерв: последний известный раунд
+    last_rid, last_rname = KNOWN_ROUND_IDS[-1]
+    print(f"Используем последний известный раунд: {last_rname}")
+    return last_rid, last_rname
+
+
+async def get_round_pgns(round_id: str) -> tuple[list[str], str]:
+    """Получить PGN всех партий раунда с Lichess. Возвращает (games, debug_info).
+    Правильный endpoint: /api/broadcast/round/{id}.pgn
+    """
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        # Основной endpoint (правильный формат Lichess API)
+        url = f"https://lichess.org/api/broadcast/round/{round_id}.pgn"
+        try:
+            r = await client.get(url, headers={"User-Agent": "CandidatesBot/1.0"})
+            debug = f"HTTP {r.status_code}, {len(r.text)} байт [{url}]"
+            print(f"get_round_pgns: {debug}")
+            if r.status_code == 200 and r.text.strip():
+                games = split_pgn(r.text)
+                return games, debug + f" → {len(games)} партий"
+            # Fallback: попробовать через весь broadcast
+            r2 = await client.get(
+                f"https://lichess.org/api/broadcast/{LICHESS_BROADCAST_ID}.pgn",
+                headers={"User-Agent": "CandidatesBot/1.0"}
+            )
+            debug2 = f"fallback HTTP {r2.status_code}, {len(r2.text)} байт"
+            if r2.status_code == 200 and r2.text.strip():
+                games = split_pgn(r2.text)
+                return games, debug2 + f" → {len(games)} партий"
+            preview = r.text[:150].replace('\n', ' ')
+            return [], f"{debug} | Ответ: {preview}"
+        except Exception as e:
+            print(f"Lichess round games error: {e}")
+            return [], f"Ошибка: {e}"
+
+
+def split_pgn(multi_pgn: str) -> list[str]:
+    """Разбить мульти-PGN на отдельные партии."""
+    games, current = [], []
+    for line in multi_pgn.splitlines():
+        if line.startswith("[Event ") and current:
+            games.append("\n".join(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        games.append("\n".join(current))
+    return [g for g in games if g.strip()]
+
+
+def pgn_to_game_data(pgn_text: str) -> dict:
+    """Создать game_data из PGN-заголовков."""
+    white_m = re.search(r'\[White "([^"]+)"\]', pgn_text)
+    black_m = re.search(r'\[Black "([^"]+)"\]', pgn_text)
+    white = white_m.group(1).split(",")[0].strip() if white_m else "White"
+    black = black_m.group(1).split(",")[0].strip() if black_m else "Black"
+    return {"white": {"username": white}, "black": {"username": black}}
+
+
+def pgn_game_id(pgn_text: str) -> str:
+    """Уникальный ID партии из PGN (White+Black)."""
+    white_m = re.search(r'\[White "([^"]+)"\]', pgn_text)
+    black_m = re.search(r'\[Black "([^"]+)"\]', pgn_text)
+    w = white_m.group(1) if white_m else "?"
+    b = black_m.group(1) if black_m else "?"
+    return f"{w}_vs_{b}"
+
+
+# ─── CHESS.COM — РЕПЕРТУАР ИГРОКА ─────────────────────────────
+async def get_player_recent_openings(last_name: str, color: str) -> list[str]:
+    """Получить типичные дебюты игрока из архива chess.com."""
+    chess_com_user = PLAYER_CHESS_COM.get(last_name)
+    if not chess_com_user:
+        return []
+    openings = []
+    now = datetime.datetime.utcnow()
+    async with httpx.AsyncClient(timeout=15) as client:
+        for delta in range(2):
+            dt = now - datetime.timedelta(days=30 * delta)
+            url = f"https://api.chess.com/pub/player/{chess_com_user}/games/{dt.year}/{dt.month:02d}"
+            try:
+                r = await client.get(url, headers={"User-Agent": "CandidatesBot/1.0"})
+                if r.status_code == 200:
+                    for g in r.json().get("games", []):
+                        if g.get("time_class") not in ("classical", "rapid"):
+                            continue
+                        w_name = g.get("white", {}).get("username", "").lower()
+                        player_color = "white" if w_name == chess_com_user.lower() else "black"
+                        if player_color != color:
+                            continue
+                        pgn_text = g.get("pgn", "")
+                        m = re.search(r'\[Opening "([^"]+)"\]', pgn_text) or \
+                            re.search(r'\[ECO "([^"]+)"\]', pgn_text)
+                        if m:
+                            openings.append(m.group(1))
+            except Exception:
+                pass
+    return openings[:30]
+
+
+# ─── АНАЛИЗ ДЕБЮТА ────────────────────────────────────────────
+def extract_opening_info(pgn_text: str) -> dict:
+    """Извлечь дебют, ходы и время из PGN."""
+    result = {"opening": None, "eco": None, "first_moves": [],
+              "white_time_remaining": None, "black_time_remaining": None}
+
+    for tag, key in [("Opening", "opening"), ("ECO", "eco")]:
+        m = re.search(rf'\[{tag} "([^"]+)"\]', pgn_text)
+        if m:
+            result[key] = m.group(1)
+
+    try:
+        game = chess.pgn.read_game(io.StringIO(pgn_text))
+        if game:
+            board, moves, node = game.board(), [], game
+            while node.variations and len(moves) < 10:
+                node = node.variations[0]
+                moves.append(board.san(node.move))
+                board.push(node.move)
+            result["first_moves"] = moves
+    except Exception:
+        pass
+
+    clk = re.findall(r'\[%clk (\d+:\d+:\d+|\d+:\d+)\]', pgn_text)
+    def fmt(t):
+        p = t.split(":")
+        if len(p) == 3:
+            return f"{int(p[0])*60+int(p[1])}м {int(p[2])}с"
+        return f"{p[0]}м {p[1]}с"
+    if len(clk) >= 2:
+        result["white_time_remaining"] = fmt(clk[0::2][-1])
+        result["black_time_remaining"] = fmt(clk[1::2][-1])
+
+    return result
+
+
+def count_moves_pgn(pgn_text: str) -> int:
+    """Посчитать число полуходов в партии из PGN (без Stockfish)."""
+    try:
+        game = chess.pgn.read_game(io.StringIO(pgn_text))
+        if game:
+            return len(list(game.mainline_moves()))
+    except Exception:
+        pass
+    # Fallback: считаем номера ходов из текста
+    nums = re.findall(r'(\d+)\.', pgn_text)
+    return int(nums[-1]) * 2 if nums else 0
+
+
+# ─── STOCKFISH ────────────────────────────────────────────────
+def evaluate_position(pgn_text: str) -> dict | None:
+    try:
+        game = chess.pgn.read_game(io.StringIO(pgn_text))
+        if not game:
+            return None
+        board = game.board()
+        moves = list(game.mainline_moves())
+        for m in moves:
+            board.push(m)
+
+        with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
+            info = engine.analyse(board, chess.engine.Limit(depth=20))
+
+        score = info["score"].white()
+        if score.is_mate():
+            eval_num = 99.0 if score.mate() > 0 else -99.0
+            eval_str = f"Мат в {score.mate()}"
+        else:
+            eval_num = score.score() / 100.0
+            eval_str = f"{eval_num:+.2f}"
+
+        best = info.get("pv", [None])[0]
+        return {
+            "eval_num":   eval_num,
+            "eval_str":   eval_str,
+            "best_move":  board.san(best) if best else "—",
+            "move_count": len(moves),
+            "moves_san":  [game.board().san(m) for m in moves][-10:],
+        }
+    except Exception as e:
+        print(f"Stockfish error: {e}")
+        return None
+
+
+# ─── CLAUDE ───────────────────────────────────────────────────
+def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str) -> str:
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    white = game_data["white"]["username"]
+    black = game_data["black"]["username"]
+    events = {
+        "eval_swing": f"резкое изменение оценки до {eval_data['eval_str']}",
+        "novelty":    f"дебют завершился рано (ход {eval_data['move_count']})",
+        "new_game":   "партия началась",
+        "game_over":  "партия завершена",
+    }
+    prompt = f"""Ты — гроссмейстер, комментируешь турнир претендентов 2026.
+
+Партия: {white} (белые) vs {black} (чёрные)
+Ход: {eval_data['move_count']} | Оценка: {eval_data['eval_str']} | Лучший ход: {eval_data['best_move']}
+Последние ходы: {', '.join(eval_data.get('moves_san', []))}
+Событие: {events.get(event_type, event_type)}
+
+3-5 предложений, живо и экспертно на русском. Не упоминай что ты ИИ."""
+
+    r = client.messages.create(
+        model="claude-sonnet-4-6", max_tokens=400,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return r.content[0].text
+
+
+async def get_opening_analysis(game_data: dict, opening_info: dict,
+                                white_rep: list, black_rep: list) -> str:
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    white = game_data["white"]["username"]
+    black = game_data["black"]["username"]
+
+    prompt = f"""Ты — гроссмейстер, анализируешь дебют на турнире претендентов 2026. Прошло 15 минут.
+
+Партия: {white} (белые) vs {black} (чёрные)
+Дебют: {opening_info.get('opening') or opening_info.get('eco') or 'неизвестен'} (ECO: {opening_info.get('eco','—')})
+Первые ходы: {' '.join(opening_info.get('first_moves',[])[:8])}
+Остаток времени: {white} — {opening_info.get('white_time_remaining','?')} | {black} — {opening_info.get('black_time_remaining','?')}
+
+Репертуар {white} за белых: {', '.join(white_rep[:10]) or 'нет данных'}
+Репертуар {black} за чёрных: {', '.join(black_rep[:10]) or 'нет данных'}
+
+4-6 предложений в прямом эфире:
+1. В репертуаре ли этот дебют у каждого игрока?
+2. Кто скорее всего был удивлён — и почему?
+3. Что говорит расход времени о том, кто думал в дебюте?
+Не упоминай что ты ИИ."""
+
+    r = client.messages.create(
+        model="claude-sonnet-4-6", max_tokens=500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return r.content[0].text
+
+
+# ─── TELEGRAM ─────────────────────────────────────────────────
+async def send_update(bot: Bot, message: str):
+    """Отправить сообщение. При ошибке Markdown — повторить без форматирования."""
+    try:
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
+    except Exception as e:
+        print(f"Markdown send error: {e} — retrying as plain text")
+        try:
+            plain = re.sub(r'[*_`]', '', message)
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=plain)
+        except Exception as e2:
+            print(f"Plain text send also failed: {e2}")
+
+
+def is_game_finished(pgn_text: str) -> bool:
+    """Партия завершена если результат не '*'."""
+    m = re.search(r'\[Result "([^"]+)"\]', pgn_text)
+    return bool(m) and m.group(1) in ("1-0", "0-1", "1/2-1/2")
+
+
+def get_game_result(pgn_text: str) -> str:
+    m = re.search(r'\[Result "([^"]+)"\]', pgn_text)
+    return m.group(1) if m else "*"
+
+
+async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
+    """Отправить итоговый разбор тура после завершения всех партий."""
+    results_lines = []
+    results_for_claude = []
+    for pgn in games_pgn:
+        gd = pgn_to_game_data(pgn)
+        w, b = gd["white"]["username"], gd["black"]["username"]
+        res = get_game_result(pgn)
+        info = extract_opening_info(pgn)
+        n_moves = count_moves_pgn(pgn)
+        n_moves_str = str(n_moves) if n_moves else "?"
+        icon = "½" if res == "1/2-1/2" else ("1–0" if res == "1-0" else "0–1")
+        opening = info.get("opening") or info.get("eco") or "неизвестно"
+        first_moves = " ".join(info.get("first_moves", [])[:6])
+        results_lines.append(f"*{w} – {b}*: {icon} ({n_moves_str} ходов)")
+        results_for_claude.append(
+            f"• {w} (белые) vs {b} (чёрные): {res}, {n_moves_str} ходов. "
+            f"Дебют: {opening}. Первые ходы: {first_moves}."
+        )
+
+    # Claude-разбор в стиле шахматного Telegram-канала
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    prompt = f"""Ты пишешь для русскоязычного шахматного Telegram-канала. Подводишь итоги {round_name} турнира претендентов 2026 в Пафосе.
+
+Результаты:
+{chr(10).join(results_for_claude)}
+
+Требования к тексту:
+- Стиль: короткие фактические предложения, как в спортивной новостной заметке
+- 5-7 предложений, никаких заголовков (#), никаких маркированных списков
+- По каждой решающей партии: кто владел инициативой, в каком дебюте, какой был ключевой момент или ошибка, какой эндшпиль
+- По ничьим: было ли равно с дебюта или кто-то перевёл
+- В конце — одна фраза о турнирной интриге
+- Шахматные термины на русском: "ферзевый гамбит", "ладейный эндшпиль", "разноцветные слоны" и т.д.
+- В самом конце новой строкой: #турнир_претендентов
+- Не упоминай что ты ИИ"""
+
+    r = client.messages.create(
+        model="claude-sonnet-4-6", max_tokens=500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    analysis = r.content[0].text.strip()
+    # Убрать случайные markdown-заголовки если Claude всё же добавил
+    analysis = re.sub(r'^#+\s+', '', analysis, flags=re.MULTILINE)
+
+    results_block = "\n".join(results_lines)
+    msg = (f"🏁 *{round_name} — итоги*\n\n"
+           f"{results_block}\n\n"
+           f"{analysis}")
+    await send_update(bot, msg)
+
+
+async def get_round_preview(pairs: list[tuple[str, str]]) -> str:
+    """Claude генерирует H2H статистику и прогноз для каждой партии тура."""
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    pairs_text = "\n".join([f"• {w} (белые) – {b} (чёрные)" for w, b in pairs])
+
+    prompt = f"""Ты — шахматный аналитик, пишешь превью тура Кандидатов 2026 для Telegram-канала.
+
+Пары тура:
+{pairs_text}
+
+Для каждой партии напиши строго в таком формате (по одной строке на партию):
+
+*Белый – Чёрный*: W-D-L в классике. [Один конкретный факт об истории встреч или стиле] — [краткий прогноз на сегодня]
+
+Правила:
+- W-D-L = победы белого / ничьи / победы чёрного за всю карьеру в классических OTB партиях
+- Если встреч мало или нет — так и скажи: "первая встреча" или "X классических партий"
+- Прогноз: 1 предложение, конкретно — острая борьба, позиционная игра, теоретическая битва
+- Факты только из реальных шахматных баз (chessgames.com, 365chess)
+- Не упоминай что ты ИИ
+- Никаких заголовков и списков — только строки в указанном формате"""
+
+    r = client.messages.create(
+        model="claude-sonnet-4-6", max_tokens=500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return r.content[0].text.strip()
+
+
+async def send_round_start(bot: Bot, round_name: str, games_pgn: list[str]):
+    today = datetime.datetime.utcnow().strftime("%-d %B %Y")
+    pairs = []
+    for pgn in games_pgn:
+        gd = pgn_to_game_data(pgn)
+        w, b = gd["white"]["username"], gd["black"]["username"]
+        pairs.append((w, b))
+
+    # Время начала по Лиссабону и Москве
+    start_utc = ROUND_SCHEDULE.get(round_name)
+    time_line = ""
+    if start_utc:
+        lisbon = (start_utc + datetime.timedelta(hours=1)).strftime("%H:%M")
+        moscow = (start_utc + datetime.timedelta(hours=3)).strftime("%H:%M")
+        time_line = f"\n🕐 *{lisbon} Лиссабон / {moscow} Москва*\n"
+
+    # H2H прогноз от Claude
+    try:
+        preview = await get_round_preview(pairs)
+    except Exception as e:
+        print(f"Preview error: {e}")
+        preview = ""
+
+    pairs_lines = "\n".join([f"• *{w}* — *{b}*" for w, b in pairs])
+
+    msg = (f"🏆 *Турнир Претендентов — {round_name}*\n"
+           f"_{today}_"
+           f"{time_line}\n"
+           f"Пары тура:\n{pairs_lines}\n\n"
+           f"📊 *История встреч и прогноз:*\n{preview}\n\n"
+           f"Слежу за всеми партиями 📡")
+    await send_update(bot, msg)
+
+
+async def send_15min_status(bot: Bot, game_data: dict, pgn: str):
+    info = extract_opening_info(pgn)
+    white = game_data["white"]["username"]
+    black = game_data["black"]["username"]
+
+    white_rep, black_rep = await asyncio.gather(
+        get_player_recent_openings(white, "white"),
+        get_player_recent_openings(black, "black"),
+    )
+    analysis = await get_opening_analysis(game_data, info, white_rep, black_rep)
+
+    opening = info.get("opening") or info.get("eco") or "дебют"
+    eco = f" ({info['eco']})" if info.get("eco") else ""
+    moves = " ".join(info.get("first_moves", [])[:6])
+    wt = info.get("white_time_remaining", "—")
+    bt = info.get("black_time_remaining", "—")
+
+    msg = (f"🕐 *{white} — {black}* | 15 минут\n"
+           f"Дебют: *{opening}*{eco}\n"
+           f"Ходы: `{moves}`\n"
+           f"⏱ {white}: {wt} | {black}: {bt}\n\n"
+           f"🧠 *Анализ дебюта:*\n{analysis}")
+    await send_update(bot, msg)
+
+
+def format_event_msg(game_data: dict, eval_data: dict, event_type: str, commentary: str) -> str:
+    w = game_data["white"]["username"]
+    b = game_data["black"]["username"]
+    icons = {"eval_swing": "📈", "novelty": "🔬", "game_over": "🏁", "new_game": "♟️"}
+    return (f"{icons.get(event_type,'♟️')} *{w} — {b}*\n"
+            f"Ход {eval_data['move_count']} | Оценка: `{eval_data['eval_str']}` | "
+            f"Лучший ход: `{eval_data['best_move']}`\n\n"
+            f"🧠 *Комментарий гроссмейстера:*\n{commentary}")
+
+
+# ─── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────
+async def main():
+    bot = Bot(token=TELEGRAM_TOKEN)
+    print("✅ Бот запущен. Слежу за турниром претендентов 2026...")
+
+    while True:
+        try:
+            now = time.time()
+            round_id, round_name = await get_active_round_id()
+
+            if not round_id:
+                print("Нет активного раунда на Lichess, жду...")
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            games_pgn, pgn_debug = await get_round_pgns(round_id)
+            print(f"Раунд {round_name} ({round_id}): {pgn_debug}")
+
+            # ── Анонс нового раунда ──────────────────────────
+            # Анонсируем только когда хотя бы одна партия реально началась (ход > 0)
+            # и не все партии уже завершены (раунд не прошлый)
+            games_started = [p for p in games_pgn if count_moves_pgn(p) > 0]
+            if (games_started
+                    and round_id not in announced_rounds
+                    and not all(is_game_finished(p) for p in games_pgn)):
+                announced_rounds.add(round_id)
+                await send_round_start(bot, round_name, games_pgn)
+
+            for pgn in games_pgn:
+                game_id = pgn_game_id(pgn)
+                game_data = pgn_to_game_data(pgn)
+
+                if game_id not in game_start_times:
+                    game_start_times[game_id] = now
+
+                eval_data = evaluate_position(pgn)
+                if not eval_data:
+                    continue
+
+                prev = seen_games.get(game_id)
+                event_type = None
+
+                # Не отправлять ничего пока партия не началась (ход 0 = игроки ещё не сели)
+                if eval_data["move_count"] == 0:
+                    seen_games[game_id] = eval_data
+                    continue
+
+                if (prev is None or prev.get("move_count", 0) == 0) and not is_game_finished(pgn):
+                    event_type = "new_game"
+                elif abs(eval_data["eval_num"] - prev["eval_num"]) >= EVAL_SWING_THRESHOLD:
+                    event_type = "eval_swing"
+                elif (eval_data["move_count"] <= NOVELTY_MOVE_THRESHOLD
+                      and prev.get("move_count", 0) < eval_data["move_count"]):
+                    event_type = "novelty"
+
+                if event_type:
+                    commentary = get_gm_commentary(game_data, eval_data, event_type)
+                    msg = format_event_msg(game_data, eval_data, event_type, commentary)
+                    await send_update(bot, msg)
+
+                seen_games[game_id] = eval_data
+
+                # ── 15-минутный анализ дебюта ──────────────────
+                elapsed = now - game_start_times.get(game_id, now)
+                if (elapsed >= OPENING_STATUS_DELAY
+                        and game_id not in games_15min_done
+                        and eval_data["move_count"] >= 5):
+                    games_15min_done.add(game_id)
+                    await send_15min_status(bot, game_data, pgn)
+
+            # ── Итоговый разбор тура ─────────────────────────
+            if (games_pgn
+                    and round_id not in round_summary_done
+                    and len(games_pgn) >= 2
+                    and all(is_game_finished(p) for p in games_pgn)):
+                round_summary_done.add(round_id)
+                await send_round_summary(bot, round_name, games_pgn)
+
+        except Exception as e:
+            print(f"Loop error: {e}")
+
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

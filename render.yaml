@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: chess-candidates-bot
+    runtime: docker
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: STOCKFISH_PATH
+        value: /usr/games/stockfish
