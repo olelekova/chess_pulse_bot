@@ -21,7 +21,7 @@ git config user.name "Chess Bot"
 
 # Коммит и пуш
 git add bot.py Dockerfile requirements.txt render.yaml push.sh
-git commit -m "H2H score format X:Y (chess points); board image for all events; message truncation fix"
+git commit -m "Fix event logic: game_over bug, novelty spam, eval_swing cooldown 5 moves"
 git push --force origin main
 
 echo "✅ Готово! Render задеплоит автоматически."

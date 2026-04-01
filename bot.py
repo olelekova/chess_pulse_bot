@@ -74,22 +74,36 @@ ROUND_SCHEDULE = {
 }
 REST_DAYS = {"2026-04-02", "2026-04-06", "2026-04-10", "2026-04-13"}
 
+# Русские имена игроков (для комментариев и сообщений)
+PLAYER_NAMES_RU = {
+    "Caruana":        "Каруана",
+    "Nakamura":       "Накамура",
+    "Giri":           "Гири",
+    "Praggnanandhaa": "Прагг",
+    "Sindarov":       "Синдаров",
+    "Wei":            "Вэй И",
+    "Esipenko":       "Есипенко",
+    "Bluebaum":       "Блюбаум",
+}
+
 # Маппинг фамилий из PGN → username на chess.com для репертуара
 PLAYER_CHESS_COM = {
-    "Caruana":       "fabiano-caruana",
-    "Nakamura":      "hikaru",
-    "Giri":          "anish-giri",
+    "Caruana":        "fabiano-caruana",
+    "Nakamura":       "hikaru",
+    "Giri":           "anish-giri",
     "Praggnanandhaa": "praggnanandhaa",
-    "Sindarov":      "sindarov",
-    "Wei":           "wei-yi-cn",
-    "Esipenko":      "esipenko",
-    "Bluebaum":      "bluebaum",
+    "Sindarov":       "sindarov",
+    "Wei":            "wei-yi-cn",
+    "Esipenko":       "esipenko",
+    "Bluebaum":       "bluebaum",
 }
 
 # ─── СОСТОЯНИЕ ────────────────────────────────────────────────
 seen_games          = {}   # game_id → последний eval_data
 game_start_times    = {}   # game_id → timestamp первого обнаружения
 games_15min_done    = set()
+games_over_sent     = set()  # game_id → уже отправили game_over
+games_swing_move    = {}   # game_id → ход последнего eval_swing (кулдаун)
 announced_rounds    = set()  # round_id → объявили старт тура
 round_summary_done  = set()  # round_id → уже отправили итог тура
 
@@ -177,11 +191,13 @@ def split_pgn(multi_pgn: str) -> list[str]:
 
 
 def pgn_to_game_data(pgn_text: str) -> dict:
-    """Создать game_data из PGN-заголовков."""
+    """Создать game_data из PGN-заголовков. Имена переводятся в русские."""
     white_m = re.search(r'\[White "([^"]+)"\]', pgn_text)
     black_m = re.search(r'\[Black "([^"]+)"\]', pgn_text)
-    white = white_m.group(1).split(",")[0].strip() if white_m else "White"
-    black = black_m.group(1).split(",")[0].strip() if black_m else "Black"
+    white_en = white_m.group(1).split(",")[0].strip() if white_m else "White"
+    black_en = black_m.group(1).split(",")[0].strip() if black_m else "Black"
+    white = PLAYER_NAMES_RU.get(white_en, white_en)
+    black = PLAYER_NAMES_RU.get(black_en, black_en)
     return {"white": {"username": white}, "black": {"username": black}}
 
 
@@ -351,23 +367,44 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str) -> str:
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
     white = game_data["white"]["username"]
     black = game_data["black"]["username"]
-    events = {
-        "eval_swing": f"резкое изменение оценки до {eval_data['eval_str']}",
-        "novelty":    f"дебют завершился рано (ход {eval_data['move_count']})",
-        "new_game":   "партия началась",
-        "game_over":  "партия завершена",
-    }
-    prompt = f"""Ты — гроссмейстер, комментируешь турнир претендентов 2026.
+    moves = ', '.join(eval_data.get('moves_san', []))
 
-Партия: {white} (белые) vs {black} (чёрные)
+    if event_type in ("eval_swing", "game_over"):
+        # Стиль: аналитик с мнением — конкретные оценки, предсказания, лёгкая провокация
+        event_desc = {
+            "eval_swing": f"оценка резко изменилась до {eval_data['eval_str']}",
+            "game_over":  "партия завершена",
+        }.get(event_type, event_type)
+        prompt = f"""Ты — шахматный аналитик с характером, комментируешь турнир претендентов 2026 для Telegram-канала.
+
+Партия: {white} (белые) – {black} (чёрные)
 Ход: {eval_data['move_count']} | Оценка: {eval_data['eval_str']} | Лучший ход: {eval_data['best_move']}
-Последние ходы: {', '.join(eval_data.get('moves_san', []))}
-Событие: {events.get(event_type, event_type)}
+Последние ходы: {moves}
+Событие: {event_desc}
 
-3-5 предложений, живо и экспертно на русском. Не упоминай что ты ИИ."""
+Напиши 3–4 предложения в стиле: конкретный факт о позиции → твоя оценка ситуации с мнением → прогноз или интрига.
+Пиши уверенно, можно с лёгкой иронией. Называй игроков по фамилии. Не упоминай что ты ИИ."""
+        max_tokens = 350
+
+    else:
+        # Стиль: телеграфный — только факты, коротко и по делу
+        event_desc = {
+            "new_game": f"партия началась, ход {eval_data['move_count']}",
+            "novelty":  f"дебют завершился рано, ход {eval_data['move_count']}",
+        }.get(event_type, event_type)
+        prompt = f"""Ты — шахматный комментатор, пишешь для Telegram-канала о турнире претендентов 2026.
+
+Партия: {white} (белые) – {black} (чёрные)
+Ход: {eval_data['move_count']} | Оценка: {eval_data['eval_str']} | Лучший ход: {eval_data['best_move']}
+Последние ходы: {moves}
+Событие: {event_desc}
+
+Напиши 2–3 коротких фактических предложения: что происходит на доске и почему это важно.
+Никакой воды, только конкретика. Называй игроков по фамилии. Не упоминай что ты ИИ."""
+        max_tokens = 220
 
     r = client.messages.create(
-        model="claude-sonnet-4-6", max_tokens=400,
+        model="claude-sonnet-4-6", max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}]
     )
     return r.content[0].text
@@ -650,13 +687,21 @@ async def main():
                     seen_games[game_id] = eval_data
                     continue
 
-                if (prev is None or prev.get("move_count", 0) == 0) and not is_game_finished(pgn):
+                # 1. Конец партии — отправить один раз
+                if is_game_finished(pgn) and game_id not in games_over_sent and prev is not None:
+                    games_over_sent.add(game_id)
+                    event_type = "game_over"
+
+                # 2. Новая партия — первое обнаружение с ходами
+                elif (prev is None or prev.get("move_count", 0) == 0) and not is_game_finished(pgn):
                     event_type = "new_game"
-                elif abs(eval_data["eval_num"] - prev["eval_num"]) >= EVAL_SWING_THRESHOLD:
-                    event_type = "eval_swing"
-                elif (eval_data["move_count"] <= NOVELTY_MOVE_THRESHOLD
-                      and prev.get("move_count", 0) < eval_data["move_count"]):
-                    event_type = "novelty"
+
+                # 3. Резкое изменение оценки — кулдаун минимум 5 ходов
+                elif prev and abs(eval_data["eval_num"] - prev["eval_num"]) >= EVAL_SWING_THRESHOLD:
+                    last_swing = games_swing_move.get(game_id, 0)
+                    if eval_data["move_count"] - last_swing >= 5:
+                        games_swing_move[game_id] = eval_data["move_count"]
+                        event_type = "eval_swing"
 
                 if event_type:
                     commentary = get_gm_commentary(game_data, eval_data, event_type)
