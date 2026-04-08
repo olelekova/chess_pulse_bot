@@ -16,7 +16,8 @@ import chess.pgn
 import chess.svg
 import cairosvg
 import httpx
-from telegram import Bot
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from anthropic import Anthropic
 
 # ─── НАСТРОЙКИ ────────────────────────────────────────────────
@@ -29,6 +30,11 @@ POLL_INTERVAL_SECONDS = 300    # проверять каждые 5 минут
 EVAL_SWING_THRESHOLD  = 1.2    # оповещать при изменении оценки ≥ 1.2 пешки
 NOVELTY_MOVE_THRESHOLD = 15    # сигнал если дебют кончился до хода 15
 OPENING_STATUS_DELAY  = 900    # 15 минут до дебютного анализа
+
+# Периодические пульс-апдейты (секунды от старта партии)
+# 60 мин — миттельшпиль; 120 мин — контроль хода 40; 180 мин — поздняя стадия
+PULSE_INTERVALS = [3600, 7200, 10800]
+PULSE_LABELS    = {3600: "1 час", 7200: "2 часа", 10800: "3 часа"}
 
 # Lichess Broadcast — FIDE Candidates 2026 (серия целиком)
 LICHESS_BROADCAST_ID = "oe4JqS3R"
@@ -100,12 +106,14 @@ PLAYER_CHESS_COM = {
 
 # ─── СОСТОЯНИЕ ────────────────────────────────────────────────
 seen_games          = {}   # game_id → последний eval_data
+games_baseline_eval = {}   # game_id → eval_data на момент последнего уведомления (базовая линия для swing)
 game_start_times    = {}   # game_id → timestamp первого обнаружения
 games_15min_done    = set()
 games_over_sent     = set()  # game_id → уже отправили game_over
 games_swing_move    = {}   # game_id → ход последнего eval_swing (кулдаун)
 announced_rounds    = set()  # round_id → объявили старт тура
 round_summary_done  = set()  # round_id → уже отправили итог тура
+games_pulse_sent    = {}   # game_id → set(секунд) уже отправленных пульс-апдейтов
 
 # ─── LICHESS API ──────────────────────────────────────────────
 async def get_active_round_id() -> tuple[str | None, str | None]:
@@ -194,11 +202,13 @@ def pgn_to_game_data(pgn_text: str) -> dict:
     """Создать game_data из PGN-заголовков. Имена переводятся в русские."""
     white_m = re.search(r'\[White "([^"]+)"\]', pgn_text)
     black_m = re.search(r'\[Black "([^"]+)"\]', pgn_text)
+    result_m = re.search(r'\[Result "([^"]+)"\]', pgn_text)
     white_en = white_m.group(1).split(",")[0].strip() if white_m else "White"
     black_en = black_m.group(1).split(",")[0].strip() if black_m else "Black"
     white = PLAYER_NAMES_RU.get(white_en, white_en)
     black = PLAYER_NAMES_RU.get(black_en, black_en)
-    return {"white": {"username": white}, "black": {"username": black}}
+    result = result_m.group(1) if result_m else "*"
+    return {"white": {"username": white}, "black": {"username": black}, "result": result}
 
 
 def pgn_game_id(pgn_text: str) -> str:
@@ -349,10 +359,12 @@ def analyze_clocks(pgn_text: str) -> dict:
                 prev_b = clk
 
         return {
-            "white_rem": fmt(white_rem),
-            "black_rem": fmt(black_rem),
-            "longest": longest,
-            "longest_str": fmt(longest_secs) if longest else None,
+            "white_rem":     fmt(white_rem),
+            "black_rem":     fmt(black_rem),
+            "white_rem_sec": white_rem,
+            "black_rem_sec": black_rem,
+            "longest":       longest,
+            "longest_str":   fmt(longest_secs) if longest else None,
         }
     except Exception as e:
         print(f"Clock analysis error: {e}")
@@ -384,6 +396,140 @@ def get_board_png(pgn_text: str) -> bytes | None:
         return None
 
 
+def get_board_png_at_move(pgn_text: str, move_index: int) -> bytes | None:
+    """Сгенерировать PNG доски на конкретном полуходу (0 = начало)."""
+    try:
+        game = chess.pgn.read_game(io.StringIO(pgn_text))
+        if not game:
+            return None
+        board = game.board()
+        last_move = None
+        for i, move in enumerate(game.mainline_moves()):
+            if i >= move_index:
+                break
+            last_move = move
+            board.push(move)
+        svg_text = chess.svg.board(
+            board=board,
+            lastmove=last_move,
+            size=400,
+            colors={"square light": "#f0d9b5", "square dark": "#b58863",
+                    "square light lastmove": "#cdd16e", "square dark lastmove": "#aaa23b"}
+        )
+        return cairosvg.svg2png(bytestring=svg_text.encode())
+    except Exception as e:
+        print(f"Board at move error: {e}")
+        return None
+
+
+def find_turning_point(pgn_text: str) -> dict | None:
+    """Найти переломный момент партии — ход с наибольшим изменением оценки.
+    Возвращает dict с номером хода, SAN, eval до/после, доской.
+    Использует быстрый Stockfish depth=14 для каждой позиции."""
+    try:
+        game = chess.pgn.read_game(io.StringIO(pgn_text))
+        if not game:
+            return None
+        moves = list(game.mainline_moves())
+        if len(moves) < 6:
+            return None
+
+        board = game.board()
+        san_list = []
+        temp = game.board()
+        for m in moves:
+            san_list.append(temp.san(m))
+            temp.push(m)
+
+        evals = []
+        with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
+            b = game.board()
+            for i, move in enumerate(moves):
+                info = engine.analyse(b, chess.engine.Limit(depth=10))
+                sc = info["score"].white()
+                if sc.is_mate():
+                    ev = 99.0 if sc.mate() > 0 else -99.0
+                else:
+                    ev = sc.score() / 100.0
+                evals.append(ev)
+                b.push(move)
+
+        # Найти ход с наибольшим изменением оценки
+        best_swing = 0.0
+        best_idx = 1
+        for i in range(1, len(evals)):
+            swing = abs(evals[i] - evals[i - 1])
+            if swing > best_swing:
+                best_swing = swing
+                best_idx = i
+
+        move_num = best_idx // 2 + 1
+        color = "белых" if best_idx % 2 == 0 else "чёрных"
+        san = san_list[best_idx]
+        eval_before = evals[best_idx - 1]
+        eval_after = evals[best_idx]
+
+        # Получить FEN позиции ПОСЛЕ переломного хода
+        board_at_tp = game.board()
+        for j in range(best_idx + 1):
+            board_at_tp.push(moves[j])
+        fen_after = board_at_tp.fen()
+
+        return {
+            "move_index": best_idx + 1,   # для get_board_png_at_move (после этого хода)
+            "move_num": move_num,
+            "color": color,
+            "san": san,
+            "eval_before": f"{eval_before:+.2f}",
+            "eval_after": f"{eval_after:+.2f}",
+            "swing": best_swing,
+            "fen": fen_after,
+        }
+    except Exception as e:
+        print(f"Turning point error: {e}")
+        return None
+
+
+def fen_to_piece_list(fen: str, white_name: str, black_name: str) -> str:
+    """Разбирает FEN и возвращает читаемый список фигур по клеткам.
+    Например: 'Белые (Накамура): Крg1, Лf1, п a2 g2 h2\nЧёрные (Каруана): Крg8, Лb2, п a5 c6'
+    """
+    piece_names = {
+        "K": "Кр", "Q": "Ф", "R": "Л", "B": "С", "N": "К", "P": "п",
+    }
+    try:
+        board = chess.Board(fen)
+    except Exception:
+        return ""
+
+    white_pieces: dict[str, list[str]] = {}
+    black_pieces: dict[str, list[str]] = {}
+
+    for sq in chess.SQUARES:
+        piece = board.piece_at(sq)
+        if piece is None:
+            continue
+        sq_name = chess.square_name(sq)
+        sym = piece_names.get(piece.symbol().upper(), piece.symbol().upper())
+        if piece.color == chess.WHITE:
+            white_pieces.setdefault(sym, []).append(sq_name)
+        else:
+            black_pieces.setdefault(sym, []).append(sq_name)
+
+    def fmt_side(pieces: dict[str, list[str]]) -> str:
+        order = ["Кр", "Ф", "Л", "С", "К", "п"]
+        parts = []
+        for sym in order:
+            if sym in pieces:
+                squares = " ".join(sorted(pieces[sym]))
+                parts.append(f"{sym} {squares}")
+        return ", ".join(parts)
+
+    w = fmt_side(white_pieces)
+    b = fmt_side(black_pieces)
+    return f"Белые ({white_name}): {w}\nЧёрные ({black_name}): {b}"
+
+
 def count_moves_pgn(pgn_text: str) -> int:
     """Посчитать число полуходов в партии из PGN (без Stockfish)."""
     try:
@@ -408,6 +554,35 @@ def evaluate_position(pgn_text: str) -> dict | None:
         for m in moves:
             board.push(m)
 
+        # Вычислить SAN ходов заново — game.board() даёт начальную позицию
+        temp_board = game.board()
+        all_san = []
+        for m in moves:
+            try:
+                all_san.append(temp_board.san(m))
+            except Exception:
+                all_san.append(m.uci())
+            temp_board.push(m)
+
+        # Если партия завершена (мат/пат/сдача), Stockfish может не справиться —
+        # возвращаем данные без оценки, чтобы game_over всё равно отправился
+        if board.is_game_over():
+            result = game.headers.get("Result", "*")
+            if result == "1-0":
+                eval_num, eval_str = 99.0, "1-0"
+            elif result == "0-1":
+                eval_num, eval_str = -99.0, "0-1"
+            else:
+                eval_num, eval_str = 0.0, "½-½"
+            return {
+                "eval_num":   eval_num,
+                "eval_str":   eval_str,
+                "best_move":  "—",
+                "move_count": len(moves),
+                "moves_san":  all_san[-10:],
+                "fen":        board.fen(),
+            }
+
         with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
             info = engine.analyse(board, chess.engine.Limit(depth=20))
 
@@ -420,16 +595,6 @@ def evaluate_position(pgn_text: str) -> dict | None:
             eval_str = f"{eval_num:+.2f}"
 
         best = info.get("pv", [None])[0]
-        # Вычислить SAN ходов заново — game.board() даёт начальную позицию,
-        # нельзя звать san() для ходов середины партии на ней
-        temp_board = game.board()
-        all_san = []
-        for m in moves:
-            try:
-                all_san.append(temp_board.san(m))
-            except Exception:
-                all_san.append(m.uci())
-            temp_board.push(m)
 
         return {
             "eval_num":   eval_num,
@@ -437,6 +602,7 @@ def evaluate_position(pgn_text: str) -> dict | None:
             "best_move":  board.san(best) if best else "—",
             "move_count": len(moves),
             "moves_san":  all_san[-10:],
+            "fen":        board.fen(),
         }
     except Exception as e:
         print(f"Stockfish error: {e}")
@@ -444,28 +610,54 @@ def evaluate_position(pgn_text: str) -> dict | None:
 
 
 # ─── CLAUDE ───────────────────────────────────────────────────
-def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str) -> str:
+def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
+                      clock_info: dict | None = None) -> str:
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
     white = game_data["white"]["username"]
     black = game_data["black"]["username"]
     moves = ', '.join(eval_data.get('moves_san', []))
 
-    if event_type in ("eval_swing", "game_over"):
+    # Явная подсказка Claude о времени
+    time_note = ""
+    if clock_info:
+        ws = clock_info.get("white_rem_sec", 0)
+        bs = clock_info.get("black_rem_sec", 0)
+        diff_min = int(abs(ws - bs) // 60)
+        if diff_min >= 2:
+            leader = white if ws > bs else black
+            time_note = f"\nПо времени опережает {leader} (на ~{diff_min} мин)"
+
+    if event_type in ("eval_swing", "eval_swing_missed", "game_over"):
         # Стиль: аналитик с мнением — конкретные оценки, предсказания, лёгкая провокация
+        result_str = game_data.get("result", "*")
+        result_ru = {"1-0": f"1-0 ({white})", "0-1": f"0-1 ({black})",
+                     "1/2-1/2": "½-½"}.get(result_str, "результат неизвестен")
         event_desc = {
             "eval_swing": f"оценка резко изменилась до {eval_data['eval_str']}",
-            "game_over":  "партия завершена",
+            "eval_swing_missed": f"преимущество упущено — оценка вернулась к {eval_data['eval_str']}",
+            "game_over":  f"партия завершена — {result_ru}",
         }.get(event_type, event_type)
+        fen = eval_data.get("fen", "")
+        piece_list = fen_to_piece_list(fen, white, black)
+        missed_note = ""
+        if event_type == "eval_swing_missed":
+            # Определяем кто упустил: положительная baseline = белые, отрицательная = чёрные
+            base_ev = eval_data.get("baseline_eval_num", 0)
+            missed_side = white if base_ev > 0 else black
+            missed_note = f"\nВАЖНО: {missed_side} упустил(а) серьёзное преимущество! Раньше оценка была {base_ev:+.2f}, а сейчас {eval_data['eval_str']}. Обязательно укажи это — кто упустил, как и почему это драматично."
         prompt = f"""Ты — шахматный аналитик с характером, комментируешь турнир претендентов 2026 для Telegram-канала.
 
 Партия: {white} (белые) – {black} (чёрные)
 Ход: {eval_data['move_count']} | Оценка: {eval_data['eval_str']} | Лучший ход: {eval_data['best_move']}
 Последние ходы: {moves}
-Событие: {event_desc}
+Фигуры на доске (точные данные):
+{piece_list}{time_note}
+Событие: {event_desc}{missed_note}
 
-Напиши 3–4 предложения в стиле: конкретный факт о позиции → твоя оценка ситуации с мнением → прогноз или интрига.
-Пиши уверенно, можно с лёгкой иронией. Называй игроков по фамилии. Не упоминай что ты ИИ.
-Без заголовков, списков и markdown-форматирования. Только обычный текст."""
+Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения.
+Напиши 3–4 предложения: конкретный факт о позиции → оценка → прогноз.
+Пиши уверенно, можно с иронией. Называй игроков по фамилии. Не упоминай что ты ИИ.
+Без заголовков и markdown. Только обычный текст."""
         max_tokens = 350
 
     else:
@@ -474,16 +666,20 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str) -> str:
             "new_game": f"партия началась, ход {eval_data['move_count']}",
             "novelty":  f"дебют завершился рано, ход {eval_data['move_count']}",
         }.get(event_type, event_type)
+        fen = eval_data.get("fen", "")
+        piece_list = fen_to_piece_list(fen, white, black)
         prompt = f"""Ты — шахматный комментатор, пишешь для Telegram-канала о турнире претендентов 2026.
 
 Партия: {white} (белые) – {black} (чёрные)
 Ход: {eval_data['move_count']} | Оценка: {eval_data['eval_str']} | Лучший ход: {eval_data['best_move']}
 Последние ходы: {moves}
+Фигуры на доске (точные данные):
+{piece_list}{time_note}
 Событие: {event_desc}
 
-Напиши 2–3 коротких фактических предложения: что происходит на доске и почему это важно.
-Никакой воды, только конкретика. Называй игроков по фамилии. Не упоминай что ты ИИ.
-Без заголовков, списков и markdown-форматирования. Только обычный текст."""
+Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения.
+Напиши 2–3 коротких фактических предложения: что происходит и почему важно.
+Называй игроков по фамилии. Не упоминай что ты ИИ. Без заголовков и markdown."""
         max_tokens = 220
 
     r = client.messages.create(
@@ -519,6 +715,70 @@ async def get_opening_analysis(game_data: dict, opening_info: dict,
     return r.content[0].text
 
 
+async def get_turning_point_commentary(game_data: dict, tp: dict, result: str) -> str:
+    """Claude комментирует переломный момент партии."""
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    white = game_data["white"]["username"]
+    black = game_data["black"]["username"]
+    result_ru = {"1-0": f"1-0 ({white})", "0-1": f"0-1 ({black})",
+                 "1/2-1/2": "½-½"}.get(result, "результат неизвестен")
+
+    piece_list = fen_to_piece_list(tp.get("fen", ""), white, black)
+
+    prompt = f"""Ты — шахматный аналитик, пишешь разбор партии для Telegram-канала о турнире претендентов 2026.
+
+Партия: {white} (белые) – {black} (чёрные)
+Результат: {result_ru}
+Переломный момент: ход {tp['move_num']} ({tp['color']}) — {tp['san']}
+Оценка до хода: {tp['eval_before']} → после: {tp['eval_after']} (изменение: {tp['swing']:.1f} пешки)
+
+Позиция ПОСЛЕ этого хода (расположение фигур на доске):
+{piece_list}
+
+ВАЖНО: Описывай ТОЛЬКО те фигуры и пешки, которые реально присутствуют в позиции выше. Не упоминай фигуры или пешки, которых нет на доске.
+
+Напиши ровно 2–3 предложения — строго про этот конкретный ход:
+1. Что именно сделал этот ход на доске (какую угрозу создал / какую слабость вскрыл / какую фигуру активизировал)
+2. Почему оценка изменилась именно так
+
+Запрещено: рассуждать об упущенных шансах, альтернативных продолжениях, что могло бы быть.
+Только факты про этот ход. Без заголовков и markdown. Называй игроков по фамилии."""
+
+    r = client.messages.create(
+        model="claude-sonnet-4-6", max_tokens=320,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return r.content[0].text.strip()
+
+
+async def send_game_analysis(bot: Bot, game_data: dict, pgn: str):
+    """Отправить разбор завершённой партии с переломным моментом."""
+    white = game_data["white"]["username"]
+    black = game_data["black"]["username"]
+    result = game_data.get("result", "*")
+    result_icon = {"1-0": "⚪️ 1-0", "0-1": "⚫️ 0-1", "1/2-1/2": "🤝 ½-½"}.get(result, "")
+
+    # Ищем переломный момент через Stockfish — в отдельном потоке чтобы не блокировать бот
+    loop = asyncio.get_event_loop()
+    tp = await loop.run_in_executor(None, find_turning_point, pgn)
+    if not tp:
+        print(f"No turning point found for {white} vs {black}")
+        return
+
+    commentary = await get_turning_point_commentary(game_data, tp, result)
+    png = get_board_png_at_move(pgn, tp["move_index"])
+
+    msg = (f"🔍 *Разбор: {white} — {black}* {result_icon}\n"
+           f"Переломный момент: ход *{tp['move_num']}. {tp['san']}* ({tp['color']})\n"
+           f"Оценка: `{tp['eval_before']}` → `{tp['eval_after']}`\n\n"
+           f"{commentary}")
+
+    if png:
+        await send_update_with_photo(bot, msg, pgn_override_png=png)
+    else:
+        await send_update(bot, msg)
+
+
 # ─── TELEGRAM ─────────────────────────────────────────────────
 async def send_update(bot: Bot, message: str):
     """Отправить сообщение. При ошибке Markdown — повторить без форматирования."""
@@ -535,19 +795,34 @@ async def send_update(bot: Bot, message: str):
             print(f"Plain text send also failed: {e2}")
 
 
-async def send_update_with_photo(bot: Bot, message: str, pgn: str):
-    """Отправить сообщение с изображением доски. При ошибке — текст без картинки."""
-    png = get_board_png(pgn)
+async def send_update_with_photo(bot: Bot, message: str, pgn: str = "", pgn_override_png: bytes | None = None):
+    """Отправить сообщение с изображением доски. При ошибке — текст без картинки.
+    pgn_override_png позволяет передать уже готовый PNG (например, позицию в нужный момент).
+    Если сообщение длиннее 1024 символов — фото с коротким заголовком, полный текст отдельно."""
+    png = pgn_override_png if pgn_override_png is not None else get_board_png(pgn)
     if png:
-        # Telegram caption max = 1024 символа
-        caption = message[:1020] + "…" if len(message) > 1024 else message
         try:
-            await bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID,
-                photo=png,
-                caption=caption,
-                parse_mode="Markdown"
-            )
+            if len(message) > 1024:
+                # Берём первую строку (заголовок) как caption к фото
+                first_line = message.split("\n")[0]
+                caption = first_line[:1020] if len(first_line) > 1020 else first_line
+                await bot.send_photo(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    photo=png,
+                    caption=caption,
+                    parse_mode="Markdown"
+                )
+                # Полный текст без первой строки — отдельным сообщением
+                rest = message[len(first_line):].strip()
+                if rest:
+                    await send_update(bot, rest)
+            else:
+                await bot.send_photo(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    photo=png,
+                    caption=message,
+                    parse_mode="Markdown"
+                )
             return
         except Exception as e:
             print(f"Photo send error: {e}")
@@ -566,9 +841,12 @@ def get_game_result(pgn_text: str) -> str:
 
 
 async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
-    """Отправить итоговый разбор тура после завершения всех партий."""
+    """Отправить единый итоговый разбор тура после завершения всех партий.
+    Включает результаты, переломные моменты и таблицу — всё одним текстовым сообщением."""
     results_lines = []
     results_for_claude = []
+    loop = asyncio.get_event_loop()
+
     for pgn in games_pgn:
         gd = pgn_to_game_data(pgn)
         w, b = gd["white"]["username"], gd["black"]["username"]
@@ -576,13 +854,29 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
         info = extract_opening_info(pgn)
         n_moves = count_moves_pgn(pgn)
         n_moves_str = str(n_moves) if n_moves else "?"
-        icon = "½" if res == "1/2-1/2" else ("1–0" if res == "1-0" else "0–1")
         opening = info.get("opening") or info.get("eco") or "неизвестно"
         first_moves = " ".join(info.get("first_moves", [])[:6])
-        results_lines.append(f"*{w} – {b}*: {icon} ({n_moves_str} ходов)")
+        if res == "1-0":
+            result_line = f"⚪️ 1-0 *{w} – {b}* ({n_moves_str} ходов)"
+        elif res == "0-1":
+            result_line = f"⚫️ 0-1 *{w} – {b}* ({n_moves_str} ходов)"
+        else:
+            result_line = f"🤝 ½-½ *{w} – {b}* ({n_moves_str} ходов)"
+        results_lines.append(result_line)
+
+        # Переломный момент для каждой партии
+        tp = await loop.run_in_executor(None, find_turning_point, pgn)
+        tp_info = ""
+        if tp:
+            tp_info = (f" Переломный момент: ход {tp['move_num']}. {tp['san']} ({tp['color']}), "
+                       f"оценка {tp['eval_before']} → {tp['eval_after']}.")
+            piece_list = fen_to_piece_list(tp.get("fen", ""), w, b)
+            if piece_list:
+                tp_info += f" Позиция после хода: {piece_list}"
+
         results_for_claude.append(
             f"• {w} (белые) vs {b} (чёрные): {res}, {n_moves_str} ходов. "
-            f"Дебют: {opening}. Первые ходы: {first_moves}."
+            f"Дебют: {opening}. Первые ходы: {first_moves}.{tp_info}"
         )
 
     # Claude-разбор в стиле шахматного Telegram-канала
@@ -594,16 +888,16 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
 
 Требования к тексту:
 - Стиль: короткие фактические предложения, как в спортивной новостной заметке
-- 5-7 предложений, никаких заголовков (#), никаких маркированных списков
-- По каждой решающей партии: кто владел инициативой, в каком дебюте, какой был ключевой момент или ошибка, какой эндшпиль
-- По ничьим: было ли равно с дебюта или кто-то перевёл
+- 2-3 предложения на каждую партию: дебют, переломный момент (используй данные о конкретных ходах выше), характер борьбы
+- ВАЖНО: описывай только фигуры и пешки, которые реально указаны в позиции. Не выдумывай фигуры.
 - В конце — одна фраза о турнирной интриге
 - Шахматные термины на русском: "ферзевый гамбит", "ладейный эндшпиль", "разноцветные слоны" и т.д.
+- Без заголовков (#), без маркированных списков
 - В самом конце новой строкой: #турнир_претендентов
 - Не упоминай что ты ИИ"""
 
     r = client.messages.create(
-        model="claude-sonnet-4-6", max_tokens=500,
+        model="claude-sonnet-4-6", max_tokens=700,
         messages=[{"role": "user", "content": prompt}]
     )
     analysis = r.content[0].text.strip()
@@ -615,34 +909,81 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
            f"{results_block}\n\n"
            f"{analysis}")
     await send_update(bot, msg)
+    # Автоматически показать таблицу очков после итогов тура
+    await asyncio.sleep(2)
+    await send_standings(bot, TELEGRAM_CHAT_ID)
+
+
+async def get_tournament_h2h() -> dict[tuple[str, str], dict]:
+    """Собрать реальные результаты H2H из уже сыгранных раундов этого турнира.
+    Возвращает {(white, black): {"w_pts": float, "b_pts": float, "games": int}}."""
+    h2h: dict[tuple[str, str], dict] = {}
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        for rid, _ in KNOWN_ROUND_IDS:
+            try:
+                r = await client.get(
+                    f"https://lichess.org/api/broadcast/round/{rid}.pgn",
+                    headers={"User-Agent": "CandidatesBot/1.0"}
+                )
+                if r.status_code != 200 or not r.text.strip():
+                    continue
+                for pgn in split_pgn(r.text):
+                    if not is_game_finished(pgn):
+                        continue
+                    gd = pgn_to_game_data(pgn)
+                    w, b = gd["white"]["username"], gd["black"]["username"]
+                    res = gd.get("result", "*")
+                    key = (w, b)
+                    if key not in h2h:
+                        h2h[key] = {"w_pts": 0.0, "b_pts": 0.0, "games": 0}
+                    h2h[key]["games"] += 1
+                    if res == "1-0":
+                        h2h[key]["w_pts"] += 1.0
+                    elif res == "0-1":
+                        h2h[key]["b_pts"] += 1.0
+                    elif res == "1/2-1/2":
+                        h2h[key]["w_pts"] += 0.5
+                        h2h[key]["b_pts"] += 0.5
+            except Exception:
+                pass
+    return h2h
 
 
 async def get_round_preview(pairs: list[tuple[str, str]]) -> str:
-    """Claude генерирует H2H статистику и прогноз для каждой партии тура."""
+    """Claude генерирует превью тура с реальными H2H из этого турнира + исторический контекст."""
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    pairs_text = "\n".join([f"• {w} (белые) – {b} (чёрные)" for w, b in pairs])
+
+    # Загружаем реальные результаты этого турнира
+    tournament_h2h = await get_tournament_h2h()
+
+    # Строим блок с данными для каждой пары
+    pairs_lines = []
+    for w, b in pairs:
+        key = (w, b)
+        if key in tournament_h2h:
+            d = tournament_h2h[key]
+            score_line = f"в этом турнире: {d['w_pts']}:{d['b_pts']} ({d['games']} партий)"
+        else:
+            score_line = "в этом турнире ещё не встречались"
+        pairs_lines.append(f"• {w} (белые) – {b} (чёрные) | {score_line}")
+
+    pairs_text = "\n".join(pairs_lines)
 
     prompt = f"""Ты — шахматный аналитик, пишешь превью тура Кандидатов 2026 для Telegram-канала.
 
-Пары тура:
+Пары тура (с реальными результатами этого турнира):
 {pairs_text}
 
-Для каждой партии напиши строго в таком формате (одна строка на партию):
-
-*Белый – Чёрный*: X:Y. [Факт] — [Прогноз]
-
-Где X:Y — общий шахматный счёт в классических OTB партиях: победа = 1 очко, ничья = 0.5.
-Примеры: "3:2.5", "1.5:0.5", "0:1", "первая встреча"
+Для каждой партии напиши строго в таком формате (одна строка):
+*Белый – Чёрный*: [счёт в этом турнире]. [Факт о стиле/дебюте] — [Прогноз на эту партию]
 
 Правила:
-- Счёт ВСЕГДА в формате X:Y через двоеточие, только цифры — никаких слов
-- Если встреч мало или нет — "первая встреча" или "N партий: X:Y"
-- Данные ОБЯЗАТЕЛЬНО для всех 4 пар
-- Факт: дебютная специализация, характерный результат, особенность стиля — одно предложение
-- Прогноз: острая борьба / позиционная игра / теоретическая дуэль — одно предложение
-- Только реальные факты
-- Не упоминай что ты ИИ
-- Никаких заголовков — только 4 строки"""
+- Счёт: используй данные выше как есть — "X:Y в этом турнире" или "первая встреча в турнире"
+- Факт: дебютная специализация или характерный стиль игрока — одно предложение
+- Прогноз: чего ожидать от этой конкретной партии — одно предложение
+- Называй игроков по фамилии
+- Никаких заголовков, никакого markdown кроме *имён*
+- Ровно 4 строки"""
 
     r = client.messages.create(
         model="claude-sonnet-4-6", max_tokens=500,
@@ -685,6 +1026,65 @@ async def send_round_start(bot: Bot, round_name: str, games_pgn: list[str]):
     await send_update(bot, msg)
 
 
+async def send_pulse_update(bot: Bot, game_data: dict, pgn: str, label: str,
+                           eval_data: dict | None = None, clock_info: dict | None = None):
+    """Короткий пульс-апдейт: оценка + часы + 2 предложения Claude.
+    eval_data и clock_info можно передать извне чтобы не гонять Stockfish повторно."""
+    white = game_data["white"]["username"]
+    black = game_data["black"]["username"]
+
+    if eval_data is None:
+        eval_data = evaluate_position(pgn)
+    if eval_data is None:
+        return
+    if clock_info is None:
+        clock_info = analyze_clocks(pgn)
+
+    wr = clock_info.get("white_rem", "?") if clock_info else "?"
+    br = clock_info.get("black_rem", "?") if clock_info else "?"
+
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    moves = ", ".join(eval_data.get("moves_san", []))
+    fen = eval_data.get("fen", "")
+    # Явно вычисляем кто опережает по времени — чтобы Claude не перепутал
+    ws = clock_info.get("white_rem_sec", 0) if clock_info else 0
+    bs = clock_info.get("black_rem_sec", 0) if clock_info else 0
+    diff = abs(ws - bs)
+    diff_min = int(diff // 60)
+    if diff_min >= 2:
+        time_leader = white if ws > bs else black
+        time_note = f"По времени опережает {time_leader} (на ~{diff_min} мин)"
+    else:
+        time_note = "По времени примерно равны"
+
+    piece_list = fen_to_piece_list(fen, white, black)
+    prompt = f"""Ты — шахматный комментатор, пишешь короткий апдейт для Telegram-канала о турнире претендентов 2026.
+
+Партия: {white} (белые) – {black} (чёрные), идёт {label}
+Ход: {eval_data['move_count']} | Оценка: {eval_data['eval_str']}
+Часы: {white} — {wr}, {black} — {br}
+{time_note}
+Последние ходы: {moves}
+Фигуры на доске (точные данные):
+{piece_list}
+
+Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения.
+Ровно 2 предложения: что сейчас происходит на доске и кто выглядит лучше.
+Без воды, только факт + оценка. Без заголовков и markdown."""
+
+    r = client.messages.create(
+        model="claude-sonnet-4-6", max_tokens=150,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    commentary = r.content[0].text.strip()
+
+    msg = (f"📍 *{white} — {black}* | {label}\n"
+           f"Ход {eval_data['move_count']} | Оценка: `{eval_data['eval_str']}`\n"
+           f"⏱ {white}: `{wr}` | {black}: `{br}`\n\n"
+           f"{commentary}")
+    await send_update_with_photo(bot, msg, pgn)
+
+
 async def send_15min_status(bot: Bot, game_data: dict, pgn: str):
     info = extract_opening_info(pgn)
     white = game_data["white"]["username"]
@@ -714,7 +1114,7 @@ def format_event_msg(game_data: dict, eval_data: dict, event_type: str,
                      commentary: str, clock_info: dict | None = None) -> str:
     w = game_data["white"]["username"]
     b = game_data["black"]["username"]
-    icons = {"eval_swing": "📈", "game_over": "🏁", "new_game": "♟️"}
+    icons = {"eval_swing": "📈", "eval_swing_missed": "😱", "game_over": "🏁", "new_game": "♟️"}
 
     # Строка часов — всегда
     clock_line = ""
@@ -724,23 +1124,108 @@ def format_event_msg(game_data: dict, eval_data: dict, event_type: str,
         clock_line = f"\n⏱ {w}: `{wr}` | {b}: `{br}`"
 
         # Долгий ход — только для ключевых событий
-        if event_type in ("eval_swing", "game_over") and clock_info.get("longest"):
+        if event_type in ("eval_swing", "eval_swing_missed", "game_over") and clock_info.get("longest"):
             lt = clock_info["longest"]
             thinker = w if lt["color"] == "white" else b
             clock_line += (f"\n🤔 Дольше всего думал: *{thinker}* — "
                            f"ход {lt['move_num']}. {lt['san']} ({clock_info['longest_str']})")
 
-    return (f"{icons.get(event_type,'♟️')} *{w} — {b}*\n"
+    result_line = ""
+    if event_type == "game_over":
+        res = game_data.get("result", "*")
+        result_emoji = {"1-0": "⚪️ 1-0", "0-1": "⚫️ 0-1",
+                        "1/2-1/2": "🤝 ½-½"}.get(res, "")
+        if result_emoji:
+            result_line = f"\n{result_emoji}"
+
+    return (f"{icons.get(event_type,'♟️')} *{w} — {b}*{result_line}\n"
             f"Ход {eval_data['move_count']} | Оценка: `{eval_data['eval_str']}` | "
             f"Лучший: `{eval_data['best_move']}`"
             f"{clock_line}\n\n"
             f"🧠 {commentary}")
 
 
+# ─── ТАБЛИЦА ОЧКОВ ────────────────────────────────────────────
+async def calculate_standings() -> tuple[dict[str, float], int]:
+    """Собрать очки всех игроков по всем сыгранным раундам.
+    Возвращает (points, rounds_played)."""
+    points: dict[str, float] = {name: 0.0 for name in PLAYER_NAMES_RU.values()}
+    rounds_played = 0
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        for rid, rname in KNOWN_ROUND_IDS:
+            try:
+                r = await client.get(
+                    f"https://lichess.org/api/broadcast/round/{rid}.pgn",
+                    headers={"User-Agent": "CandidatesBot/1.0"}
+                )
+                if r.status_code != 200 or not r.text.strip():
+                    continue
+                games = split_pgn(r.text)
+                finished = [g for g in games if is_game_finished(g)]
+                if not finished:
+                    continue
+                # Считаем тур сыгранным если все его партии завершены
+                if len(finished) == len(games):
+                    rounds_played += 1
+                for pgn in finished:
+                    gd = pgn_to_game_data(pgn)
+                    w = gd["white"]["username"]
+                    b = gd["black"]["username"]
+                    res = gd.get("result", "*")
+                    if res == "1-0":
+                        points[w] = points.get(w, 0) + 1.0
+                    elif res == "0-1":
+                        points[b] = points.get(b, 0) + 1.0
+                    elif res == "1/2-1/2":
+                        points[w] = points.get(w, 0) + 0.5
+                        points[b] = points.get(b, 0) + 0.5
+            except Exception as e:
+                print(f"Standings error {rname}: {e}")
+    return points, rounds_played
+
+
+async def send_standings(bot: Bot, chat_id: str | int):
+    """Отправить текущую таблицу очков в чат."""
+    try:
+        points, rounds_played = await calculate_standings()
+    except Exception as e:
+        await bot.send_message(chat_id=chat_id, text=f"Ошибка получения таблицы: {e}")
+        return
+
+    # Медали и позиции
+    medals = ["🥇", "🥈", "🥉"]
+    sorted_players = sorted(points.items(), key=lambda x: -x[1])
+
+    lines = []
+    prev_pts = None
+    rank = 0
+    display_rank = 0
+    for name, pts in sorted_players:
+        rank += 1
+        if pts != prev_pts:
+            display_rank = rank
+        prev_pts = pts
+        medal = medals[display_rank - 1] if display_rank <= 3 else f"{display_rank}."
+        # Форматируем очки: 2.0 → "2", 2.5 → "2.5"
+        pts_str = str(int(pts)) if pts == int(pts) else str(pts)
+        lines.append(f"{medal} *{name}* — {pts_str}")
+
+    rounds_str = f"после {rounds_played} туров" if rounds_played else "турнир ещё не начался"
+    msg = f"📊 *Таблица Кандидатов 2026* ({rounds_str})\n\n" + "\n".join(lines)
+    await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+
+
+async def cmd_standings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/standings — текущая таблица очков."""
+    bot = context.bot
+    chat_id = update.effective_chat.id
+    await send_standings(bot, chat_id)
+
+
 # ─── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────
-async def main():
-    bot = Bot(token=TELEGRAM_TOKEN)
-    print("✅ Бот запущен. Слежу за турниром претендентов 2026...")
+async def monitoring_loop(bot: Bot):
+    """Основной цикл мониторинга партий."""
+    print("✅ Мониторинг запущен. Слежу за турниром претендентов 2026...")
 
     while True:
         try:
@@ -757,24 +1242,49 @@ async def main():
 
             # ── Анонс нового раунда ──────────────────────────
             # Анонсируем только когда хотя бы одна партия реально началась (ход > 0)
-            # и не все партии уже завершены (раунд не прошлый)
-            games_started = [p for p in games_pgn if count_moves_pgn(p) > 0]
+            # и не все партии уже завершены (раунд не прошлый).
+            # Если бот перезапустился в середине тура (ходов уже > 5) — тихо помечаем
+            # раунд как объявленный, чтобы не дублировать анонс после деплоя.
+            # Кешируем move_count и is_finished один раз на весь цикл
+            pgn_move_counts  = {p: count_moves_pgn(p) for p in games_pgn}
+            pgn_is_finished  = {p: is_game_finished(p) for p in games_pgn}
+
+            games_started = [p for p in games_pgn if pgn_move_counts[p] > 0]
             if (games_started
                     and round_id not in announced_rounds
-                    and not all(is_game_finished(p) for p in games_pgn)):
+                    and not all(pgn_is_finished[p] for p in games_pgn)):
                 announced_rounds.add(round_id)
-                await send_round_start(bot, round_name, games_pgn)
+                max_moves = max(pgn_move_counts[p] for p in games_started)
+                if max_moves <= 5:
+                    await send_round_start(bot, round_name, games_pgn)
+                else:
+                    print(f"Раунд {round_name} уже в процессе ({max_moves} ходов) — анонс пропущен (рестарт?)")
 
             for pgn in games_pgn:
-                game_id = pgn_game_id(pgn)
+                game_id   = pgn_game_id(pgn)
                 game_data = pgn_to_game_data(pgn)
-
-                if game_id not in game_start_times:
-                    game_start_times[game_id] = now
+                finished  = pgn_is_finished[pgn]   # из кеша — не парсим PGN повторно
 
                 eval_data = evaluate_position(pgn)
                 if not eval_data:
                     continue
+
+                # Запоминаем момент первого обнаружения партии.
+                # Используем move_count из уже посчитанного eval_data — без лишнего вызова.
+                if game_id not in game_start_times:
+                    game_start_times[game_id] = now
+                    # Бот мог перезапуститься в середине партии — помечаем уже
+                    # пройденные этапы по числу ходов, чтобы не дублировать сообщения
+                    mc = eval_data["move_count"]
+                    if mc > 12:
+                        games_15min_done.add(game_id)
+                    sent = games_pulse_sent.setdefault(game_id, set())
+                    if mc > 20:
+                        sent.add(3600)
+                    if mc > 38:
+                        sent.add(7200)
+                    if mc > 52:
+                        sent.add(10800)
 
                 prev = seen_games.get(game_id)
                 event_type = None
@@ -782,29 +1292,47 @@ async def main():
                 # Не отправлять ничего пока партия не началась (ход 0 = игроки ещё не сели)
                 if eval_data["move_count"] == 0:
                     seen_games[game_id] = eval_data
+                    games_baseline_eval.setdefault(game_id, eval_data)
                     continue
 
                 # 1. Конец партии — отправить один раз
-                if is_game_finished(pgn) and game_id not in games_over_sent and prev is not None:
+                # prev is not None убрано: бот должен сообщать о завершении
+                # даже если перезапустился во время партии
+                if finished and game_id not in games_over_sent:
                     games_over_sent.add(game_id)
                     event_type = "game_over"
 
                 # 2. Новая партия — первое обнаружение с ходами
-                elif (prev is None or prev.get("move_count", 0) == 0) and not is_game_finished(pgn):
+                elif (prev is None or prev.get("move_count", 0) == 0) and not finished:
                     event_type = "new_game"
 
-                # 3. Резкое изменение оценки — кулдаун минимум 5 ходов
-                elif prev and abs(eval_data["eval_num"] - prev["eval_num"]) >= EVAL_SWING_THRESHOLD:
-                    last_swing = games_swing_move.get(game_id, 0)
-                    if eval_data["move_count"] - last_swing >= 5:
-                        games_swing_move[game_id] = eval_data["move_count"]
-                        event_type = "eval_swing"
+                # 3. Резкое изменение оценки — сравниваем с базовой линией + кулдаун 5 ходов
+                else:
+                    baseline = games_baseline_eval.get(game_id, prev)
+                    if baseline:
+                        swing = eval_data["eval_num"] - baseline["eval_num"]
+                        if abs(swing) >= EVAL_SWING_THRESHOLD:
+                            last_swing = games_swing_move.get(game_id, 0)
+                            if eval_data["move_count"] - last_swing >= 5:
+                                games_swing_move[game_id] = eval_data["move_count"]
+                                # Определяем: упущенное преимущество или нет
+                                base_ev = baseline["eval_num"]
+                                curr_ev = eval_data["eval_num"]
+                                if abs(base_ev) >= 1.5 and abs(curr_ev) < 0.8:
+                                    # Было большое преимущество, стало ~ровно
+                                    event_type = "eval_swing_missed"
+                                    eval_data["baseline_eval_num"] = base_ev
+                                else:
+                                    event_type = "eval_swing"
 
                 if event_type:
-                    commentary = get_gm_commentary(game_data, eval_data, event_type)
                     clock_info = analyze_clocks(pgn)
+                    commentary = get_gm_commentary(game_data, eval_data, event_type, clock_info)
                     msg = format_event_msg(game_data, eval_data, event_type, commentary, clock_info)
                     await send_update_with_photo(bot, msg, pgn)
+                    # Разбор переломного момента теперь включён в итоги тура (send_round_summary)
+                    # Обновляем базовую линию только при отправке уведомления
+                    games_baseline_eval[game_id] = eval_data
 
                 seen_games[game_id] = eval_data
 
@@ -812,15 +1340,28 @@ async def main():
                 elapsed = now - game_start_times.get(game_id, now)
                 if (elapsed >= OPENING_STATUS_DELAY
                         and game_id not in games_15min_done
-                        and eval_data["move_count"] >= 5):
+                        and eval_data["move_count"] >= 5
+                        and not finished):
                     games_15min_done.add(game_id)
                     await send_15min_status(bot, game_data, pgn)
+
+                # ── Пульс-апдейты через 60/120/180 мин ─────────
+                if not finished:
+                    sent_pulses = games_pulse_sent.setdefault(game_id, set())
+                    for interval in PULSE_INTERVALS:
+                        if elapsed >= interval and interval not in sent_pulses:
+                            sent_pulses.add(interval)
+                            label = PULSE_LABELS[interval]
+                            # Передаём уже посчитанные eval_data и clock_info — Stockfish не нужен повторно
+                            pulse_clocks = clock_info if event_type else analyze_clocks(pgn)
+                            await send_pulse_update(bot, game_data, pgn, label,
+                                                    eval_data=eval_data, clock_info=pulse_clocks)
 
             # ── Итоговый разбор тура ─────────────────────────
             if (games_pgn
                     and round_id not in round_summary_done
                     and len(games_pgn) >= 2
-                    and all(is_game_finished(p) for p in games_pgn)):
+                    and all(pgn_is_finished[p] for p in games_pgn)):  # используем кеш
                 round_summary_done.add(round_id)
                 await send_round_summary(bot, round_name, games_pgn)
 
@@ -828,6 +1369,24 @@ async def main():
             print(f"Loop error: {e}")
 
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+async def main():
+    # Приложение с поддержкой команд
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("standings", cmd_standings))
+
+    bot = app.bot
+
+    async with app:
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+        print("✅ Бот запущен (мониторинг + команды)")
+        # Параллельно запускаем мониторинг
+        await monitoring_loop(bot)
+        # monitoring_loop бесконечный — до сюда не доходим при штатной работе
+        await app.updater.stop()
+        await app.stop()
 
 
 if __name__ == "__main__":
