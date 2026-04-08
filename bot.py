@@ -119,7 +119,10 @@ games_pulse_sent    = {}   # game_id → set(секунд) уже отправл
 async def get_active_round_id() -> tuple[str | None, str | None]:
     """Найти активный раунд Open турнира через PGN endpoint.
     JSON /api/broadcast/round/{id} возвращает 404 — используем только .pgn endpoint.
-    Идём от последнего раунда к первому, возвращаем первый где не все партии завершены."""
+    Идём от последнего раунда к первому.
+    Приоритет: раунд с незавершёнными партиями. Если такого нет — последний
+    завершённый раунд (чтобы бот мог отправить game_over и итоги тура)."""
+    latest_finished = None  # самый поздний завершённый раунд
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         for rid, rname in reversed(KNOWN_ROUND_IDS):
             try:
@@ -141,14 +144,20 @@ async def get_active_round_id() -> tuple[str | None, str | None]:
                     # Раунд активен если хотя бы одна партия ещё не завершена
                     if finished_count < len(games):
                         return rid, rname
-                    # Все завершены — этот раунд закончен, продолжаем поиск назад
+                    # Все завершены — запоминаем как самый поздний завершённый
+                    if latest_finished is None:
+                        latest_finished = (rid, rname)
                 elif r.status_code == 404:
                     print(f"{rname} ({rid}): раунд ещё не создан (404)")
                     continue
             except Exception as e:
                 print(f"Ошибка проверки раунда {rname} ({rid}): {e}")
 
-    # Все известные раунды завершены — возвращаем последний
+    # Нет активного раунда — возвращаем последний завершённый
+    # (нужно для отправки game_over и итогов тура)
+    if latest_finished:
+        print(f"Нет активного раунда, используем последний завершённый: {latest_finished[1]}")
+        return latest_finished
     last_rid, last_rname = KNOWN_ROUND_IDS[-1]
     print(f"Все раунды завершены, используем последний: {last_rname}")
     return last_rid, last_rname
@@ -198,15 +207,34 @@ def split_pgn(multi_pgn: str) -> list[str]:
     return [g for g in games if g.strip()]
 
 
+def normalize_player_name(raw: str) -> str:
+    """Извлечь фамилию из PGN-имени и перевести в русское.
+    PGN может содержать: 'Praggnanandhaa, R', 'Praggnanandhaa R.',
+    'Wei, Yi', 'Wei Yi' — нужно сопоставить с ключами PLAYER_NAMES_RU."""
+    # Вариант 1: до запятой
+    last_name = raw.split(",")[0].strip()
+    if last_name in PLAYER_NAMES_RU:
+        return PLAYER_NAMES_RU[last_name]
+    # Вариант 2: первое слово (фамилия без инициалов)
+    first_word = raw.split()[0].strip().rstrip(",.")
+    if first_word in PLAYER_NAMES_RU:
+        return PLAYER_NAMES_RU[first_word]
+    # Вариант 3: поиск по подстроке
+    for key, ru_name in PLAYER_NAMES_RU.items():
+        if key.lower() in raw.lower():
+            return ru_name
+    return raw
+
+
 def pgn_to_game_data(pgn_text: str) -> dict:
     """Создать game_data из PGN-заголовков. Имена переводятся в русские."""
     white_m = re.search(r'\[White "([^"]+)"\]', pgn_text)
     black_m = re.search(r'\[Black "([^"]+)"\]', pgn_text)
     result_m = re.search(r'\[Result "([^"]+)"\]', pgn_text)
-    white_en = white_m.group(1).split(",")[0].strip() if white_m else "White"
-    black_en = black_m.group(1).split(",")[0].strip() if black_m else "Black"
-    white = PLAYER_NAMES_RU.get(white_en, white_en)
-    black = PLAYER_NAMES_RU.get(black_en, black_en)
+    white_raw = white_m.group(1).strip() if white_m else "White"
+    black_raw = black_m.group(1).strip() if black_m else "Black"
+    white = normalize_player_name(white_raw)
+    black = normalize_player_name(black_raw)
     result = result_m.group(1) if result_m else "*"
     return {"white": {"username": white}, "black": {"username": black}, "result": result}
 
