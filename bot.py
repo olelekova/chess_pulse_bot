@@ -450,76 +450,114 @@ def get_board_png_at_move(pgn_text: str, move_index: int) -> bytes | None:
         return None
 
 
-def find_turning_point(pgn_text: str) -> dict | None:
-    """Найти переломный момент партии — ход с наибольшим изменением оценки.
-    Возвращает dict с номером хода, SAN, eval до/после, доской.
-    Использует быстрый Stockfish depth=14 для каждой позиции."""
+def _build_tp_dict(causing_idx: int, evals: list, san_list: list,
+                   moves: list, game) -> dict:
+    """Собрать dict переломного момента по индексу хода."""
+    eval_idx = causing_idx + 1  # evals[causing_idx+1] = оценка ПОСЛЕ этого хода
+    move_num = causing_idx // 2 + 1
+    color = "белых" if causing_idx % 2 == 0 else "чёрных"
+    san = san_list[causing_idx]
+    eval_before = evals[causing_idx]
+    eval_after = evals[eval_idx]
+
+    board_at_tp = game.board()
+    for j in range(causing_idx + 1):
+        board_at_tp.push(moves[j])
+
+    return {
+        "move_index": causing_idx + 1,
+        "move_num": move_num,
+        "color": color,
+        "san": san,
+        "eval_before": f"{eval_before:+.2f}",
+        "eval_after": f"{eval_after:+.2f}",
+        "swing": abs(eval_after - eval_before),
+        "fen": board_at_tp.fen(),
+    }
+
+
+# Кэш результатов find_turning_points — чтобы не гонять Stockfish дважды
+_tp_cache: dict[str, list[dict]] = {}
+
+
+def find_turning_points(pgn_text: str) -> list[dict]:
+    """Найти два переломных момента партии:
+    1) Ход, больше всего сдвинувший оценку В ПОЛЬЗУ белых (delta > 0)
+    2) Ход, больше всего сдвинувший оценку В ПОЛЬЗУ чёрных (delta < 0)
+    Возвращает список из 1-2 dict. Результат кэшируется по game_id.
+    Пропускает первые 10 полуходов (дебютная теория)."""
+
+    game_id = pgn_game_id(pgn_text)
+    if game_id in _tp_cache:
+        return _tp_cache[game_id]
+
     try:
         game = chess.pgn.read_game(io.StringIO(pgn_text))
         if not game:
-            return None
+            return []
         moves = list(game.mainline_moves())
-        if len(moves) < 6:
-            return None
+        if len(moves) < 12:
+            return []
 
-        board = game.board()
+        # SAN-нотация для всех ходов
         san_list = []
         temp = game.board()
         for m in moves:
             san_list.append(temp.san(m))
             temp.push(m)
 
+        # Stockfish: depth=10, пропускаем первые 10 полуходов
         evals = []
         with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
             b = game.board()
             for i, move in enumerate(moves):
-                info = engine.analyse(b, chess.engine.Limit(depth=10))
-                sc = info["score"].white()
-                if sc.is_mate():
-                    ev = 99.0 if sc.mate() > 0 else -99.0
+                if i < 10:
+                    evals.append(None)  # placeholder — не анализируем
                 else:
-                    ev = sc.score() / 100.0
-                evals.append(ev)
+                    info = engine.analyse(b, chess.engine.Limit(depth=10))
+                    sc = info["score"].white()
+                    if sc.is_mate():
+                        ev = 99.0 if sc.mate() > 0 else -99.0
+                    else:
+                        ev = sc.score() / 100.0
+                    evals.append(ev)
                 b.push(move)
 
-        # Найти ход с наибольшим изменением оценки
-        # evals[i] = оценка ПЕРЕД ходом i, поэтому swing evals[i]-evals[i-1]
-        # вызван ходом (i-1)
-        best_swing = 0.0
-        best_idx = 1
-        for i in range(1, len(evals)):
-            swing = abs(evals[i] - evals[i - 1])
-            if swing > best_swing:
-                best_swing = swing
-                best_idx = i
+        # Найти два переломных момента: лучший для белых и лучший для чёрных
+        # delta = evals[i] - evals[i-1], положительная = в пользу белых
+        best_for_white = (0.0, None)  # (delta, idx)
+        best_for_black = (0.0, None)  # (abs_delta, idx)
+        for i in range(11, len(evals)):
+            if evals[i] is None or evals[i - 1] is None:
+                continue
+            delta = evals[i] - evals[i - 1]
+            if delta > best_for_white[0]:
+                best_for_white = (delta, i)
+            if delta < 0 and abs(delta) > best_for_black[0]:
+                best_for_black = (abs(delta), i)
 
-        # Ход, вызвавший изменение — это (best_idx - 1)
-        causing_idx = best_idx - 1
-        move_num = causing_idx // 2 + 1
-        color = "белых" if causing_idx % 2 == 0 else "чёрных"
-        san = san_list[causing_idx]
-        eval_before = evals[best_idx - 1]
-        eval_after = evals[best_idx]
+        results = []
+        for _, idx in [best_for_black, best_for_white]:
+            if idx is not None:
+                causing_idx = idx - 1
+                tp = _build_tp_dict(causing_idx, evals, san_list, moves, game)
+                if tp["swing"] >= 0.8:  # минимальный порог — не показывать мелкие колебания
+                    results.append(tp)
 
-        # Получить FEN позиции ПОСЛЕ переломного хода
-        board_at_tp = game.board()
-        for j in range(causing_idx + 1):
-            board_at_tp.push(moves[j])
-        fen_after = board_at_tp.fen()
+        # Сортируем по номеру хода (хронологически)
+        results.sort(key=lambda x: x["move_index"])
+        _tp_cache[game_id] = results
+        return results
 
-        return {
-            "move_index": causing_idx + 1,   # для get_board_png_at_move (после этого хода)
-            "move_num": move_num,
-            "color": color,
-            "san": san,
-            "eval_before": f"{eval_before:+.2f}",
-            "eval_after": f"{eval_after:+.2f}",
-            "swing": best_swing,
-            "fen": fen_after,
-        }
     except Exception as e:
         print(f"Turning point error: {e}")
-        return None
+        return []
+
+
+def find_turning_point(pgn_text: str) -> dict | None:
+    """Обратная совместимость — возвращает первый (главный) переломный момент."""
+    tps = find_turning_points(pgn_text)
+    return tps[0] if tps else None
 
 
 def fen_to_piece_list(fen: str, white_name: str, black_name: str) -> str:
@@ -765,29 +803,36 @@ async def get_turning_point_commentary(game_data: dict, tp: dict, result: str) -
     result_ru = {"1-0": f"1-0 ({white})", "0-1": f"0-1 ({black})",
                  "1/2-1/2": "½-½"}.get(result, "результат неизвестен")
 
-    piece_list = fen_to_piece_list(tp.get("fen", ""), white, black)
+    ev_before = float(tp['eval_before'])
+    ev_after = float(tp['eval_after'])
+    delta = ev_after - ev_before
+    side = tp['color']
+    who = white if side == "белых" else black
+    move_san = f"{tp['move_num']}. {tp['san']}" if side == "белых" else f"{tp['move_num']}...{tp['san']}"
 
-    prompt = f"""Ты — шахматный аналитик, пишешь разбор партии для Telegram-канала о турнире претендентов 2026.
+    # Определяем что произошло
+    if side == "белых" and delta > 0.5:
+        what_happened = f"{who} усилил позицию ходом {move_san}"
+    elif side == "белых" and delta < -0.5:
+        what_happened = f"{who} допустил ошибку ходом {move_san}"
+    elif side == "чёрных" and delta < -0.5:
+        what_happened = f"{who} нашёл сильный ход {move_san}"
+    elif side == "чёрных" and delta > 0.5:
+        what_happened = f"{who} ошибся ходом {move_san}"
+    else:
+        what_happened = f"ход {move_san} стал поворотным моментом"
 
-Партия: {white} (белые) – {black} (чёрные)
-Результат: {result_ru}
-Переломный момент: ход {tp['move_num']} ({tp['color']}) — {tp['san']}
-Оценка до хода: {tp['eval_before']} → после: {tp['eval_after']} (изменение: {tp['swing']:.1f} пешки)
+    prompt = f"""Ты — шахматный комментатор, пишешь разбор хода для Telegram-канала о турнире претендентов 2026.
 
-Позиция ПОСЛЕ этого хода (расположение фигур на доске):
-{piece_list}
+Партия: {white} (белые) – {black} (чёрные), результат: {result_ru}
+Что произошло: {what_happened}
 
-ВАЖНО: Описывай ТОЛЬКО те фигуры и пешки, которые реально присутствуют в позиции выше. Не упоминай фигуры или пешки, которых нет на доске.
-
-Напиши ровно 2–3 предложения — строго про этот конкретный ход:
-1. Что именно сделал этот ход на доске (какую угрозу создал / какую слабость вскрыл / какую фигуру активизировал)
-2. Почему оценка изменилась именно так
-
-Запрещено: рассуждать об упущенных шансах, альтернативных продолжениях, что могло бы быть.
-Только факты про этот ход. Без заголовков и markdown. Называй игроков по фамилии."""
+Напиши 2–3 предложения: почему этот ход сильный/слабый, что он изменил в позиции.
+НЕ пиши числовые оценки движка. Объясняй по-человечески: какая угроза, какая слабость.
+Называй игроков по фамилии. Без заголовков и markdown."""
 
     r = client.messages.create(
-        model="claude-sonnet-4-6", max_tokens=320,
+        model="claude-sonnet-4-6", max_tokens=250,
         messages=[{"role": "user", "content": prompt}]
     )
     return r.content[0].text.strip()
@@ -800,7 +845,7 @@ async def send_game_analysis(bot: Bot, game_data: dict, pgn: str):
     result = game_data.get("result", "*")
     result_icon = {"1-0": "⚪️ 1-0", "0-1": "⚫️ 0-1", "1/2-1/2": "🤝 ½-½"}.get(result, "")
 
-    # Ищем переломный момент через Stockfish — в отдельном потоке чтобы не блокировать бот
+    # Используем кэшированный результат — Stockfish не запускается повторно
     loop = asyncio.get_event_loop()
     tp = await loop.run_in_executor(None, find_turning_point, pgn)
     if not tp:
@@ -810,9 +855,11 @@ async def send_game_analysis(bot: Bot, game_data: dict, pgn: str):
     commentary = await get_turning_point_commentary(game_data, tp, result)
     png = get_board_png_at_move(pgn, tp["move_index"])
 
+    side = tp['color']
+    move_san = f"{tp['move_num']}. {tp['san']}" if side == "белых" else f"{tp['move_num']}...{tp['san']}"
+
     msg = (f"🔍 *Разбор: {white} — {black}* {result_icon}\n"
-           f"Переломный момент: ход *{tp['move_num']}. {tp['san']}* ({tp['color']})\n"
-           f"Оценка: `{tp['eval_before']}` → `{tp['eval_after']}`\n\n"
+           f"Переломный момент: ход *{move_san}* ({tp['color']})\n\n"
            f"{commentary}")
 
     if png:
@@ -906,44 +953,51 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
             result_line = f"🤝 ½-½ *{w} – {b}* ({n_moves_str} ходов)"
         results_lines.append(result_line)
 
-        # Переломный момент для каждой партии — описываем по-человечески
-        tp = await loop.run_in_executor(None, find_turning_point, pgn)
-        tp_info = ""
-        if tp:
+        # Переломные моменты — описываем по-человечески
+        tps = await loop.run_in_executor(None, find_turning_points, pgn)
+        tp_descs = []
+        for tp in tps:
             ev_before = float(tp['eval_before'])
             ev_after = float(tp['eval_after'])
-            # Определяем кто выиграл/проиграл от этого хода
             delta = ev_after - ev_before
-            side = tp['color']  # "белых" или "чёрных"
+            side = tp['color']
+            move_san = f"{tp['move_num']}. {tp['san']}" if side == "белых" else f"{tp['move_num']}...{tp['san']}"
+            who = w if side == "белых" else b
+
+            # Описание действия
             if side == "белых":
-                # Ход белых: положительная delta = белые улучшили, отрицательная = белые ошиблись
                 if delta > 0.5:
-                    tp_desc = f"белые ({w}) усилили позицию ходом {tp['move_num']}. {tp['san']}"
+                    action = f"{who} усилил позицию ходом {move_san}"
                 elif delta < -0.5:
-                    tp_desc = f"белые ({w}) допустили ошибку ходом {tp['move_num']}. {tp['san']}, упустив перевес"
+                    action = f"{who} ошибся ходом {move_san}"
                 else:
-                    tp_desc = f"ход {tp['move_num']}. {tp['san']} белых ({w}) стал поворотным моментом"
+                    action = f"ход {move_san} ({who}) стал поворотным"
             else:
-                # Ход чёрных: отрицательная delta = чёрные улучшили (с точки зрения белых ухудшилось)
                 if delta < -0.5:
-                    tp_desc = f"чёрные ({b}) нашли сильное продолжение {tp['move_num']}...{tp['san']}"
+                    action = f"{who} нашёл сильный ход {move_san}"
                 elif delta > 0.5:
-                    tp_desc = f"чёрные ({b}) допустили ошибку ходом {tp['move_num']}...{tp['san']}, упустив перевес"
+                    action = f"{who} ошибся ходом {move_san}"
                 else:
-                    tp_desc = f"ход {tp['move_num']}...{tp['san']} чёрных ({b}) стал поворотным моментом"
-            # Качественная оценка вместо цифр
-            if abs(ev_before) >= 2.0:
-                if abs(ev_after) < 0.8:
-                    tp_context = "серьёзное преимущество было упущено, позиция уравнялась"
-                else:
-                    tp_context = "преимущество сохранилось, но заметно сократилось"
+                    action = f"ход {move_san} ({who}) стал поворотным"
+
+            # Качественная оценка последствий
+            if abs(ev_before) >= 2.0 and abs(ev_after) < 0.8:
+                consequence = "преимущество упущено, позиция уравнялась"
+            elif abs(ev_before) >= 2.0 and abs(ev_after) >= 0.8:
+                consequence = "преимущество заметно сократилось"
             elif abs(ev_before) < 0.8 and abs(ev_after) >= 2.0:
-                tp_context = "позиция из равной стала решающей"
+                consequence = "позиция из равной стала решающей"
             elif abs(ev_before) < 0.8 and abs(ev_after) < 0.8:
-                tp_context = "позиция осталась примерно равной"
+                consequence = "позиция осталась примерно равной"
             else:
-                tp_context = "оценка заметно изменилась"
-            tp_info = f" Переломный момент: {tp_desc} — {tp_context}."
+                consequence = "оценка заметно изменилась"
+            tp_descs.append(f"{action} — {consequence}")
+
+        tp_info = ""
+        if len(tp_descs) == 1:
+            tp_info = f" Ключевой момент: {tp_descs[0]}."
+        elif len(tp_descs) >= 2:
+            tp_info = f" Ключевые моменты: 1) {tp_descs[0]}; 2) {tp_descs[1]}."
 
         results_for_claude.append(
             f"• {w} (белые) vs {b} (чёрные): {res}, {n_moves_str} ходов. "
