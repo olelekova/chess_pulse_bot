@@ -660,36 +660,50 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
             time_note = f"\nПо времени опережает {leader} (на ~{diff_min} мин)"
 
     if event_type in ("eval_swing", "eval_swing_missed", "game_over"):
-        # Стиль: аналитик с мнением — конкретные оценки, предсказания, лёгкая провокация
         result_str = game_data.get("result", "*")
         result_ru = {"1-0": f"1-0 ({white})", "0-1": f"0-1 ({black})",
                      "1/2-1/2": "½-½"}.get(result_str, "результат неизвестен")
-        event_desc = {
-            "eval_swing": f"оценка резко изменилась до {eval_data['eval_str']}",
-            "eval_swing_missed": f"преимущество упущено — оценка вернулась к {eval_data['eval_str']}",
-            "game_over":  f"партия завершена — {result_ru}",
-        }.get(event_type, event_type)
-        fen = eval_data.get("fen", "")
-        piece_list = fen_to_piece_list(fen, white, black)
+
+        # Качественное описание ситуации вместо числовой оценки
+        ev = eval_data["eval_num"]
+        if abs(ev) < 0.5:
+            position_desc = "позиция примерно равная"
+        elif ev >= 0.5 and ev < 1.5:
+            position_desc = f"у белых ({white}) небольшой перевес"
+        elif ev >= 1.5:
+            position_desc = f"у белых ({white}) серьёзное преимущество"
+        elif ev <= -0.5 and ev > -1.5:
+            position_desc = f"у чёрных ({black}) небольшой перевес"
+        else:
+            position_desc = f"у чёрных ({black}) серьёзное преимущество"
+
         missed_note = ""
         if event_type == "eval_swing_missed":
-            # Определяем кто упустил: положительная baseline = белые, отрицательная = чёрные
             base_ev = eval_data.get("baseline_eval_num", 0)
             missed_side = white if base_ev > 0 else black
-            missed_note = f"\nВАЖНО: {missed_side} упустил(а) серьёзное преимущество! Раньше оценка была {base_ev:+.2f}, а сейчас {eval_data['eval_str']}. Обязательно укажи это — кто упустил, как и почему это драматично."
-        prompt = f"""Ты — шахматный аналитик с характером, комментируешь турнир претендентов 2026 для Telegram-канала.
+            missed_note = f"\nВАЖНО: {missed_side} упустил(а) серьёзное преимущество! Позиция выровнялась. Укажи кто и как упустил."
+        elif event_type == "eval_swing":
+            if abs(ev) >= 2.0:
+                missed_note = f"\nСитуация становится критической — {position_desc}."
+        event_desc = {
+            "eval_swing": f"резкое изменение позиции — {position_desc}",
+            "eval_swing_missed": f"преимущество упущено, {position_desc}",
+            "game_over":  f"партия завершена — {result_ru}",
+        }.get(event_type, event_type)
+
+        prompt = f"""Ты — шахматный комментатор турнира претендентов 2026, пишешь для Telegram-канала. Стиль — как у лучших шахматных журналистов: живой, конкретный, с характером.
 
 Партия: {white} (белые) – {black} (чёрные)
-Ход: {eval_data['move_count']} | Оценка: {eval_data['eval_str']} | Лучший ход: {eval_data['best_move']}
-Последние ходы: {moves}
-Фигуры на доске (точные данные):
-{piece_list}{time_note}
+Ход: {eval_data['move_count']} | Лучший ход по движку: {eval_data['best_move']}
+Последние ходы: {moves}{time_note}
 Событие: {event_desc}{missed_note}
 
-Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения.
-Напиши 3–4 предложения: конкретный факт о позиции → оценка → прогноз.
-Пиши уверенно, можно с иронией. Называй игроков по фамилии. Не упоминай что ты ИИ.
-Без заголовков и markdown. Только обычный текст."""
+Правила:
+- НЕ ПИШИ числовые оценки движка ("+1.5", "-2.3" и т.д.) — опиши ситуацию словами
+- Назови конкретный ход если он ключевой и объясни почему он важен
+- 3–4 предложения: что случилось → почему это важно → что ожидать дальше
+- Пиши уверенно, можно с иронией. Называй игроков по фамилии
+- Не упоминай что ты ИИ. Без заголовков и markdown. Только обычный текст."""
         max_tokens = 350
 
     else:
@@ -698,20 +712,16 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
             "new_game": f"партия началась, ход {eval_data['move_count']}",
             "novelty":  f"дебют завершился рано, ход {eval_data['move_count']}",
         }.get(event_type, event_type)
-        fen = eval_data.get("fen", "")
-        piece_list = fen_to_piece_list(fen, white, black)
-        prompt = f"""Ты — шахматный комментатор, пишешь для Telegram-канала о турнире претендентов 2026.
+        prompt = f"""Ты — шахматный комментатор турнира претендентов 2026, пишешь для Telegram-канала.
 
 Партия: {white} (белые) – {black} (чёрные)
-Ход: {eval_data['move_count']} | Оценка: {eval_data['eval_str']} | Лучший ход: {eval_data['best_move']}
-Последние ходы: {moves}
-Фигуры на доске (точные данные):
-{piece_list}{time_note}
+Ход: {eval_data['move_count']} | Лучший ход: {eval_data['best_move']}
+Последние ходы: {moves}{time_note}
 Событие: {event_desc}
 
-Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения.
-Напиши 2–3 коротких фактических предложения: что происходит и почему важно.
-Называй игроков по фамилии. Не упоминай что ты ИИ. Без заголовков и markdown."""
+Напиши 2–3 коротких предложения: какой дебют, чего ожидать от этой пары.
+Не пиши числовые оценки движка. Называй игроков по фамилии.
+Не упоминай что ты ИИ. Без заголовков и markdown."""
         max_tokens = 220
 
     r = client.messages.create(
@@ -896,35 +906,76 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
             result_line = f"🤝 ½-½ *{w} – {b}* ({n_moves_str} ходов)"
         results_lines.append(result_line)
 
-        # Переломный момент для каждой партии
+        # Переломный момент для каждой партии — описываем по-человечески
         tp = await loop.run_in_executor(None, find_turning_point, pgn)
         tp_info = ""
         if tp:
-            tp_info = (f" Переломный момент: ход {tp['move_num']}. {tp['san']} ({tp['color']}), "
-                       f"оценка {tp['eval_before']} → {tp['eval_after']}.")
-            piece_list = fen_to_piece_list(tp.get("fen", ""), w, b)
-            if piece_list:
-                tp_info += f" Позиция после хода: {piece_list}"
+            ev_before = float(tp['eval_before'])
+            ev_after = float(tp['eval_after'])
+            # Определяем кто выиграл/проиграл от этого хода
+            delta = ev_after - ev_before
+            side = tp['color']  # "белых" или "чёрных"
+            if side == "белых":
+                # Ход белых: положительная delta = белые улучшили, отрицательная = белые ошиблись
+                if delta > 0.5:
+                    tp_desc = f"белые ({w}) усилили позицию ходом {tp['move_num']}. {tp['san']}"
+                elif delta < -0.5:
+                    tp_desc = f"белые ({w}) допустили ошибку ходом {tp['move_num']}. {tp['san']}, упустив перевес"
+                else:
+                    tp_desc = f"ход {tp['move_num']}. {tp['san']} белых ({w}) стал поворотным моментом"
+            else:
+                # Ход чёрных: отрицательная delta = чёрные улучшили (с точки зрения белых ухудшилось)
+                if delta < -0.5:
+                    tp_desc = f"чёрные ({b}) нашли сильное продолжение {tp['move_num']}...{tp['san']}"
+                elif delta > 0.5:
+                    tp_desc = f"чёрные ({b}) допустили ошибку ходом {tp['move_num']}...{tp['san']}, упустив перевес"
+                else:
+                    tp_desc = f"ход {tp['move_num']}...{tp['san']} чёрных ({b}) стал поворотным моментом"
+            # Качественная оценка вместо цифр
+            if abs(ev_before) >= 2.0:
+                if abs(ev_after) < 0.8:
+                    tp_context = "серьёзное преимущество было упущено, позиция уравнялась"
+                else:
+                    tp_context = "преимущество сохранилось, но заметно сократилось"
+            elif abs(ev_before) < 0.8 and abs(ev_after) >= 2.0:
+                tp_context = "позиция из равной стала решающей"
+            elif abs(ev_before) < 0.8 and abs(ev_after) < 0.8:
+                tp_context = "позиция осталась примерно равной"
+            else:
+                tp_context = "оценка заметно изменилась"
+            tp_info = f" Переломный момент: {tp_desc} — {tp_context}."
 
         results_for_claude.append(
             f"• {w} (белые) vs {b} (чёрные): {res}, {n_moves_str} ходов. "
             f"Дебют: {opening}. Первые ходы: {first_moves}.{tp_info}"
         )
 
+    # Таблица очков для контекста
+    try:
+        points, rounds_played = await calculate_standings()
+        sorted_pts = sorted(points.items(), key=lambda x: -x[1])
+        standings_text = ", ".join(f"{n} {p}" for n, p in sorted_pts if p > 0)
+    except Exception:
+        standings_text = "(таблица недоступна)"
+
     # Claude-разбор в стиле шахматного Telegram-канала
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    prompt = f"""Ты пишешь для русскоязычного шахматного Telegram-канала. Подводишь итоги {round_name} турнира претендентов 2026 в Пафосе.
+    prompt = f"""Ты пишешь итоги {round_name} турнира претендентов 2026 для русскоязычного шахматного Telegram-канала.
 
 Результаты:
 {chr(10).join(results_for_claude)}
 
-Требования к тексту:
-- Стиль: короткие фактические предложения, как в спортивной новостной заметке
-- 2-3 предложения на каждую партию: дебют, переломный момент (используй данные о конкретных ходах выше), характер борьбы
-- ВАЖНО: описывай только фигуры и пешки, которые реально указаны в позиции. Не выдумывай фигуры.
-- В конце — одна фраза о турнирной интриге
-- Шахматные термины на русском: "ферзевый гамбит", "ладейный эндшпиль", "разноцветные слоны" и т.д.
-- Без заголовков (#), без маркированных списков
+Таблица после этого тура: {standings_text}
+
+Стиль — как у chess.com или ChessBase, но на русском:
+- Пиши как спортивный журналист: короткие фактические предложения, живой язык
+- 2–3 предложения на каждую партию: название дебюта, переломный момент (используй данные выше), характер борьбы
+- Переломные моменты описывай через действие игрока, не через цифры оценки движка. НЕ ПИШИ числовые оценки вроде "+0.86" или "-3.03". Вместо этого: "Накамура выпустил перевес", "Гири перехватил инициативу", "позиция уравнялась"
+- Конкретный ход можно назвать, но объясняй его смысл по-человечески
+- НЕ описывай фигуры на доске и их расположение — это не нужно для итогов
+- В конце — 1–2 фразы о турнирной интриге с ТОЧНЫМИ очками из таблицы выше
+- Шахматные термины на русском
+- Без заголовков (#), без маркированных списков, без markdown
 - В самом конце новой строкой: #турнир_претендентов
 - Не упоминай что ты ИИ"""
 
