@@ -483,6 +483,8 @@ def find_turning_point(pgn_text: str) -> dict | None:
                 b.push(move)
 
         # Найти ход с наибольшим изменением оценки
+        # evals[i] = оценка ПЕРЕД ходом i, поэтому swing evals[i]-evals[i-1]
+        # вызван ходом (i-1)
         best_swing = 0.0
         best_idx = 1
         for i in range(1, len(evals)):
@@ -491,20 +493,22 @@ def find_turning_point(pgn_text: str) -> dict | None:
                 best_swing = swing
                 best_idx = i
 
-        move_num = best_idx // 2 + 1
-        color = "белых" if best_idx % 2 == 0 else "чёрных"
-        san = san_list[best_idx]
+        # Ход, вызвавший изменение — это (best_idx - 1)
+        causing_idx = best_idx - 1
+        move_num = causing_idx // 2 + 1
+        color = "белых" if causing_idx % 2 == 0 else "чёрных"
+        san = san_list[causing_idx]
         eval_before = evals[best_idx - 1]
         eval_after = evals[best_idx]
 
         # Получить FEN позиции ПОСЛЕ переломного хода
         board_at_tp = game.board()
-        for j in range(best_idx + 1):
+        for j in range(causing_idx + 1):
             board_at_tp.push(moves[j])
         fen_after = board_at_tp.fen()
 
         return {
-            "move_index": best_idx + 1,   # для get_board_png_at_move (после этого хода)
+            "move_index": causing_idx + 1,   # для get_board_png_at_move (после этого хода)
             "move_num": move_num,
             "color": color,
             "san": san,
