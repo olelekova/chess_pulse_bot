@@ -112,6 +112,7 @@ games_15min_done    = set()
 games_over_sent     = set()  # game_id → уже отправили game_over
 games_swing_move    = {}   # game_id → ход последнего eval_swing (кулдаун)
 announced_rounds    = set()  # round_id → объявили старт тура
+pre_announced_rounds = set()  # round_name → отправили превью до начала тура
 round_summary_done  = set()  # round_id → уже отправили итог тура
 games_pulse_sent    = {}   # game_id → set(секунд) уже отправленных пульс-апдейтов
 
@@ -680,6 +681,20 @@ def evaluate_position(pgn_text: str) -> dict | None:
 
 
 # ─── CLAUDE ───────────────────────────────────────────────────
+def _trim_to_sentence(text: str) -> str:
+    """Если текст обрезан на полуслове (нет точки/!/? в конце) — откатить до последнего предложения."""
+    text = text.strip()
+    if not text:
+        return text
+    if text[-1] in ".!?»":
+        return text
+    last_period = max(text.rfind(". "), text.rfind("! "), text.rfind("? "),
+                     text.rfind("."), text.rfind("!"), text.rfind("?"))
+    if last_period > len(text) // 3:  # не обрезать слишком коротко
+        return text[:last_period + 1]
+    return text
+
+
 def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
                       clock_info: dict | None = None) -> str:
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -729,17 +744,23 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
             "game_over":  f"партия завершена — {result_ru}",
         }.get(event_type, event_type)
 
+        # Список фигур на доске — чтобы Claude не придумывал позиции
+        fen = eval_data.get("fen", "")
+        piece_list = fen_to_piece_list(fen, white, black) if fen else ""
+        piece_block = f"\nФигуры на доске:\n{piece_list}\n" if piece_list else ""
+
         prompt = f"""Ты — шахматный комментатор турнира претендентов 2026, пишешь для Telegram-канала. Стиль — как у лучших шахматных журналистов: живой, конкретный, с характером.
 
 Партия: {white} (белые) – {black} (чёрные)
 Ход: {eval_data['move_count']} | Лучший ход по движку: {eval_data['best_move']}
 Последние ходы: {moves}{time_note}
 Событие: {event_desc}{missed_note}
-
+{piece_block}
 Правила:
 - НЕ ПИШИ числовые оценки движка ("+1.5", "-2.3" и т.д.) — опиши ситуацию словами
+- Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения фигур
 - Назови конкретный ход если он ключевой и объясни почему он важен
-- 3–4 предложения: что случилось → почему это важно → что ожидать дальше
+- 2–3 предложения: что случилось и что ожидать дальше. Коротко и по делу
 - Пиши уверенно, можно с иронией. Называй игроков по фамилии
 - Не упоминай что ты ИИ. Без заголовков и markdown. Только обычный текст."""
         max_tokens = 350
@@ -750,14 +771,21 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
             "new_game": f"партия началась, ход {eval_data['move_count']}",
             "novelty":  f"дебют завершился рано, ход {eval_data['move_count']}",
         }.get(event_type, event_type)
+
+        # Список фигур для контекста (даже в дебюте — чтобы не выдумывать)
+        fen = eval_data.get("fen", "")
+        piece_list_ng = fen_to_piece_list(fen, white, black) if fen else ""
+        piece_block_ng = f"\nФигуры на доске:\n{piece_list_ng}\n" if piece_list_ng else ""
+
         prompt = f"""Ты — шахматный комментатор турнира претендентов 2026, пишешь для Telegram-канала.
 
 Партия: {white} (белые) – {black} (чёрные)
 Ход: {eval_data['move_count']} | Лучший ход: {eval_data['best_move']}
 Последние ходы: {moves}{time_note}
 Событие: {event_desc}
-
+{piece_block_ng}
 Напиши 2–3 коротких предложения: какой дебют, чего ожидать от этой пары.
+Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения.
 Не пиши числовые оценки движка. Называй игроков по фамилии.
 Не упоминай что ты ИИ. Без заголовков и markdown."""
         max_tokens = 220
@@ -766,7 +794,7 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
         model="claude-sonnet-4-6", max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}]
     )
-    return r.content[0].text
+    return _trim_to_sentence(r.content[0].text)
 
 
 async def get_opening_analysis(game_data: dict, opening_info: dict,
@@ -792,7 +820,7 @@ async def get_opening_analysis(game_data: dict, opening_info: dict,
         model="claude-sonnet-4-6", max_tokens=280,
         messages=[{"role": "user", "content": prompt}]
     )
-    return r.content[0].text
+    return _trim_to_sentence(r.content[0].text)
 
 
 async def get_turning_point_commentary(game_data: dict, tp: dict, result: str) -> str:
@@ -822,20 +850,26 @@ async def get_turning_point_commentary(game_data: dict, tp: dict, result: str) -
     else:
         what_happened = f"ход {move_san} стал поворотным моментом"
 
+    # Список фигур на доске после переломного хода
+    tp_fen = tp.get("fen", "")
+    tp_piece_list = fen_to_piece_list(tp_fen, white, black) if tp_fen else ""
+    tp_piece_block = f"\nФигуры на доске после этого хода:\n{tp_piece_list}\n" if tp_piece_list else ""
+
     prompt = f"""Ты — шахматный комментатор, пишешь разбор хода для Telegram-канала о турнире претендентов 2026.
 
 Партия: {white} (белые) – {black} (чёрные), результат: {result_ru}
 Что произошло: {what_happened}
-
+{tp_piece_block}
 Напиши 2–3 предложения: почему этот ход сильный/слабый, что он изменил в позиции.
+Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения.
 НЕ пиши числовые оценки движка. Объясняй по-человечески: какая угроза, какая слабость.
 Называй игроков по фамилии. Без заголовков и markdown."""
 
     r = client.messages.create(
-        model="claude-sonnet-4-6", max_tokens=250,
+        model="claude-sonnet-4-6", max_tokens=300,
         messages=[{"role": "user", "content": prompt}]
     )
-    return r.content[0].text.strip()
+    return _trim_to_sentence(r.content[0].text)
 
 
 async def send_game_analysis(bot: Bot, game_data: dict, pgn: str):
@@ -1037,7 +1071,7 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
         model="claude-sonnet-4-6", max_tokens=700,
         messages=[{"role": "user", "content": prompt}]
     )
-    analysis = r.content[0].text.strip()
+    analysis = _trim_to_sentence(r.content[0].text)
     # Убрать случайные markdown-заголовки если Claude всё же добавил
     analysis = re.sub(r'^#+\s+', '', analysis, flags=re.MULTILINE)
 
@@ -1126,7 +1160,7 @@ async def get_round_preview(pairs: list[tuple[str, str]]) -> str:
         model="claude-sonnet-4-6", max_tokens=500,
         messages=[{"role": "user", "content": prompt}]
     )
-    return r.content[0].text.strip()
+    return _trim_to_sentence(r.content[0].text)
 
 
 async def send_round_start(bot: Bot, round_name: str, games_pgn: list[str]):
@@ -1161,6 +1195,39 @@ async def send_round_start(bot: Bot, round_name: str, games_pgn: list[str]):
            f"📊 *История встреч в классике:*\n{preview}\n\n"
            f"Слежу за всеми партиями 📡")
     await send_update(bot, msg)
+
+
+async def check_pre_round_announcement(bot: Bot):
+    """Проверяет расписание и отправляет анонс за ~30 мин до начала тура.
+    Пары берём из PGN на Lichess (обычно доступны заранее)."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    for round_name, start_utc in ROUND_SCHEDULE.items():
+        if round_name in pre_announced_rounds:
+            continue
+        # Ищём раунд, который начнётся через 10–35 минут
+        delta = (start_utc - now_utc).total_seconds()
+        if not (600 <= delta <= 2100):  # 10–35 min
+            continue
+        # Нашли подходящий раунд — ищем его round_id
+        rid = None
+        for r_id, r_name in KNOWN_ROUND_IDS:
+            if r_name == round_name:
+                rid = r_id
+                break
+        if not rid:
+            continue
+        # Пробуем получить PGN (пары могут быть уже выставлены)
+        try:
+            games_pgn, _ = await get_round_pgns(rid)
+            if games_pgn:
+                pre_announced_rounds.add(round_name)
+                announced_rounds.add(rid)  # не дублировать потом
+                await send_round_start(bot, round_name, games_pgn)
+                print(f"Предварительный анонс {round_name} отправлен ({int(delta//60)} мин до старта)")
+            else:
+                print(f"PGN для {round_name} пока недоступен, повторю позже")
+        except Exception as e:
+            print(f"Ошибка предварительного анонса {round_name}: {e}")
 
 
 async def send_pulse_update(bot: Bot, game_data: dict, pgn: str, label: str,
@@ -1213,7 +1280,7 @@ async def send_pulse_update(bot: Bot, game_data: dict, pgn: str, label: str,
         model="claude-sonnet-4-6", max_tokens=150,
         messages=[{"role": "user", "content": prompt}]
     )
-    commentary = r.content[0].text.strip()
+    commentary = _trim_to_sentence(r.content[0].text)
 
     msg = (f"📍 *{white} — {black}* | {label}\n"
            f"Ход {eval_data['move_count']} | Оценка: `{eval_data['eval_str']}`\n"
@@ -1367,6 +1434,10 @@ async def monitoring_loop(bot: Bot):
     while True:
         try:
             now = time.time()
+
+            # ── Предварительный анонс тура (за ~30 мин до старта) ──
+            await check_pre_round_announcement(bot)
+
             round_id, round_name = await get_active_round_id()
 
             if not round_id:
