@@ -81,7 +81,9 @@ ROUND_SCHEDULE = {
 REST_DAYS = {"2026-04-02", "2026-04-06", "2026-04-10", "2026-04-13"}
 
 # Русские имена игроков (для комментариев и сообщений)
+# Объединённый словарь: Open + Women — имена не пересекаются
 PLAYER_NAMES_RU = {
+    # Open
     "Caruana":        "Каруана",
     "Nakamura":       "Накамура",
     "Giri":           "Гири",
@@ -90,7 +92,21 @@ PLAYER_NAMES_RU = {
     "Wei":            "Вэй И",
     "Esipenko":       "Есипенко",
     "Bluebaum":       "Блюбаум",
+    # Women
+    "Zhu":            "Чжу Цзиньэр",
+    "Tan":            "Тань Чжунъи",
+    "Goryachkina":    "Горячкина",
+    "Muzychuk":       "Музычук",
+    "Assaubayeva":    "Ассаубаева",
+    "Lagno":          "Лагно",
+    "Deshmukh":       "Дешмук",
+    "Vaishali":       "Вайшали",
+    "Rameshbabu":     "Вайшали",
 }
+
+# Множества русских имён для фильтрации таблиц
+OPEN_PLAYERS_RU = {"Каруана", "Накамура", "Гири", "Прагг", "Синдаров", "Вэй И", "Есипенко", "Блюбаум"}
+WOMEN_PLAYERS_RU = {"Чжу Цзиньэр", "Тань Чжунъи", "Горячкина", "Музычук", "Ассаубаева", "Лагно", "Дешмук", "Вайшали"}
 
 # Маппинг фамилий из PGN → username на chess.com для репертуара
 PLAYER_CHESS_COM = {
@@ -104,7 +120,37 @@ PLAYER_CHESS_COM = {
     "Bluebaum":       "bluebaum",
 }
 
-# ─── СОСТОЯНИЕ ────────────────────────────────────────────────
+# ═══ ЖЕНСКИЙ ТУРНИР ПРЕТЕНДЕНТОВ 2026 ═════════════════════════
+# Облегчённый мониторинг: превью тура → пульс 1ч → пульс 2ч → итоги
+WOMEN_BROADCAST_ID = "xj4qM8Nw"   # ID серии (не раунда!)
+
+# Хардкод раундов — fallback если discover_women_rounds() не сработает.
+# Round 10 и далее будут найдены автоматически через discover_women_rounds().
+WOMEN_KNOWN_ROUND_IDS = [
+    ("diPdGkEA", "Round 1"),
+    ("EMkf0c6e", "Round 2"),
+    ("2qEm9CH3", "Round 3"),
+    ("MDv2BlCp", "Round 4"),
+    ("VAELuM6E", "Round 5"),
+    ("hmGcNp3P", "Round 6"),
+    ("QqBr2Kpr", "Round 7"),
+    ("R0BP4Jy4", "Round 8"),
+    ("6Ukl08Ir", "Round 9"),
+    ("Es2IjSwE", "Round 10"),
+    ("fDNFUpG9", "Round 11"),
+    ("u3pemMHq", "Round 12"),
+    ("o7DgltDn", "Round 13"),
+    ("dllZX7eJ", "Round 14"),
+]
+
+# Расписание совпадает с Open (тот же день, то же время старта)
+WOMEN_ROUND_SCHEDULE = dict(ROUND_SCHEDULE)
+
+# Пульс-апдейты для женского турнира: только 1ч и 2ч (без 3ч)
+WOMEN_PULSE_INTERVALS = [3600, 7200]
+WOMEN_PULSE_LABELS    = {3600: "1 час", 7200: "2 часа"}
+
+# ─── СОСТОЯНИЕ (Open) ─────────────────────────────────────────
 seen_games          = {}   # game_id → последний eval_data
 games_baseline_eval = {}   # game_id → eval_data на момент последнего уведомления (базовая линия для swing)
 game_start_times    = {}   # game_id → timestamp первого обнаружения
@@ -115,6 +161,15 @@ announced_rounds    = set()  # round_id → объявили старт тура
 pre_announced_rounds = set()  # round_name → отправили превью до начала тура
 round_summary_done  = set()  # round_id → уже отправили итог тура
 games_pulse_sent    = {}   # game_id → set(секунд) уже отправленных пульс-апдейтов
+
+# ─── СОСТОЯНИЕ (Women) ───────────────────────────────────────
+w_game_start_times     = {}      # game_id → timestamp
+w_games_over_sent      = set()   # game_id → game_over отправлен
+w_announced_rounds     = set()   # round_id → анонс раунда
+w_pre_announced_rounds = set()   # round_name → превью
+w_round_summary_done   = set()   # round_id → итог тура
+w_games_pulse_sent     = {}      # game_id → set(секунд)
+w_last_discover_ts     = 0.0    # timestamp последнего discover_women_rounds()
 
 # ─── LICHESS API ──────────────────────────────────────────────
 async def get_active_round_id() -> tuple[str | None, str | None]:
@@ -601,6 +656,93 @@ def fen_to_piece_list(fen: str, white_name: str, black_name: str) -> str:
     return f"Белые ({white_name}): {w}\nЧёрные ({black_name}): {b}"
 
 
+def analyze_pawn_structure(fen: str) -> str:
+    """Анализ пешечной структуры из FEN: проходные, изолированные, сдвоенные.
+    Возвращает читаемый текст для промпта."""
+    try:
+        board = chess.Board(fen)
+    except Exception:
+        return ""
+
+    files = "abcdefgh"
+    file_idx = {f: i for i, f in enumerate(files)}
+
+    # Собираем пешки по цветам: {file_index: [rank, ...]}
+    w_pawns: dict[int, list[int]] = {}  # файл → список рядов
+    b_pawns: dict[int, list[int]] = {}
+    for sq in chess.SQUARES:
+        piece = board.piece_at(sq)
+        if piece is None or piece.piece_type != chess.PAWN:
+            continue
+        f = chess.square_file(sq)
+        r = chess.square_rank(sq)
+        if piece.color == chess.WHITE:
+            w_pawns.setdefault(f, []).append(r)
+        else:
+            b_pawns.setdefault(f, []).append(r)
+
+    def find_passed(own: dict[int, list[int]], opp: dict[int, list[int]], is_white: bool) -> list[str]:
+        """Проходная пешка: на её файле и соседних файлах нет вражеских пешек впереди."""
+        passed = []
+        for f, ranks in own.items():
+            adj_files = [af for af in [f - 1, f, f + 1] if 0 <= af <= 7]
+            for r in ranks:
+                blocked = False
+                for af in adj_files:
+                    for opp_r in opp.get(af, []):
+                        if is_white and opp_r > r:
+                            blocked = True
+                        elif not is_white and opp_r < r:
+                            blocked = True
+                if not blocked:
+                    sq_name = files[f] + str(r + 1)
+                    passed.append(sq_name)
+        return sorted(passed)
+
+    def find_isolated(own: dict[int, list[int]]) -> list[str]:
+        """Изолированная пешка: на соседних файлах нет своих пешек."""
+        isolated = []
+        for f, ranks in own.items():
+            has_neighbor = any(af in own for af in [f - 1, f + 1] if 0 <= af <= 7)
+            if not has_neighbor:
+                for r in ranks:
+                    isolated.append(files[f] + str(r + 1))
+        return sorted(isolated)
+
+    def find_doubled(own: dict[int, list[int]]) -> list[str]:
+        """Сдвоенные пешки: 2+ пешки на одном файле."""
+        doubled = []
+        for f, ranks in own.items():
+            if len(ranks) >= 2:
+                doubled.append(files[f])
+        return sorted(doubled)
+
+    lines = []
+    w_passed = find_passed(w_pawns, b_pawns, True)
+    b_passed = find_passed(b_pawns, w_pawns, False)
+    w_isolated = find_isolated(w_pawns)
+    b_isolated = find_isolated(b_pawns)
+    w_doubled = find_doubled(w_pawns)
+    b_doubled = find_doubled(b_pawns)
+
+    if w_passed:
+        lines.append(f"Проходные белых: {', '.join(w_passed)}")
+    if b_passed:
+        lines.append(f"Проходные чёрных: {', '.join(b_passed)}")
+    if not w_passed and not b_passed:
+        lines.append("Проходных пешек нет")
+    if w_isolated:
+        lines.append(f"Изолированные белых: {', '.join(w_isolated)}")
+    if b_isolated:
+        lines.append(f"Изолированные чёрных: {', '.join(b_isolated)}")
+    if w_doubled:
+        lines.append(f"Сдвоенные белых: файлы {', '.join(w_doubled)}")
+    if b_doubled:
+        lines.append(f"Сдвоенные чёрных: файлы {', '.join(b_doubled)}")
+
+    return "\n".join(lines)
+
+
 def count_moves_pgn(pgn_text: str) -> int:
     """Посчитать число полуходов в партии из PGN (без Stockfish)."""
     try:
@@ -748,6 +890,8 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
         fen = eval_data.get("fen", "")
         piece_list = fen_to_piece_list(fen, white, black) if fen else ""
         piece_block = f"\nФигуры на доске:\n{piece_list}\n" if piece_list else ""
+        pawn_info = analyze_pawn_structure(fen) if fen else ""
+        pawn_block = f"\nПешечная структура (точные данные):\n{pawn_info}\n" if pawn_info else ""
 
         prompt = f"""Ты — шахматный комментатор турнира претендентов 2026, пишешь для Telegram-канала. Стиль — как у лучших шахматных журналистов: живой, конкретный, с характером.
 
@@ -755,10 +899,11 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
 Ход: {eval_data['move_count']} | Лучший ход по движку: {eval_data['best_move']}
 Последние ходы: {moves}{time_note}
 Событие: {event_desc}{missed_note}
-{piece_block}
+{piece_block}{pawn_block}
 Правила:
 - НЕ ПИШИ числовые оценки движка ("+1.5", "-2.3" и т.д.) — опиши ситуацию словами
 - Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения фигур
+- Используй ТОЛЬКО данные о пешечной структуре из раздела выше (проходные, изолированные, сдвоенные) — не определяй их самостоятельно
 - Назови конкретный ход если он ключевой и объясни почему он важен
 - 2–3 предложения: что случилось и что ожидать дальше. Коротко и по делу
 - Пиши уверенно, можно с иронией. Называй игроков по фамилии
@@ -776,6 +921,8 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
         fen = eval_data.get("fen", "")
         piece_list_ng = fen_to_piece_list(fen, white, black) if fen else ""
         piece_block_ng = f"\nФигуры на доске:\n{piece_list_ng}\n" if piece_list_ng else ""
+        pawn_info_ng = analyze_pawn_structure(fen) if fen else ""
+        pawn_block_ng = f"\nПешечная структура (точные данные):\n{pawn_info_ng}\n" if pawn_info_ng else ""
 
         prompt = f"""Ты — шахматный комментатор турнира претендентов 2026, пишешь для Telegram-канала.
 
@@ -783,9 +930,10 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
 Ход: {eval_data['move_count']} | Лучший ход: {eval_data['best_move']}
 Последние ходы: {moves}{time_note}
 Событие: {event_desc}
-{piece_block_ng}
+{piece_block_ng}{pawn_block_ng}
 Напиши 2–3 коротких предложения: какой дебют, чего ожидать от этой пары.
 Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения.
+Используй ТОЛЬКО данные о пешечной структуре из раздела выше — не определяй проходные/изолированные/сдвоенные пешки самостоятельно.
 Не пиши числовые оценки движка. Называй игроков по фамилии.
 Не упоминай что ты ИИ. Без заголовков и markdown."""
         max_tokens = 220
@@ -854,14 +1002,17 @@ async def get_turning_point_commentary(game_data: dict, tp: dict, result: str) -
     tp_fen = tp.get("fen", "")
     tp_piece_list = fen_to_piece_list(tp_fen, white, black) if tp_fen else ""
     tp_piece_block = f"\nФигуры на доске после этого хода:\n{tp_piece_list}\n" if tp_piece_list else ""
+    tp_pawn_info = analyze_pawn_structure(tp_fen) if tp_fen else ""
+    tp_pawn_block = f"\nПешечная структура (точные данные):\n{tp_pawn_info}\n" if tp_pawn_info else ""
 
     prompt = f"""Ты — шахматный комментатор, пишешь разбор хода для Telegram-канала о турнире претендентов 2026.
 
 Партия: {white} (белые) – {black} (чёрные), результат: {result_ru}
 Что произошло: {what_happened}
-{tp_piece_block}
+{tp_piece_block}{tp_pawn_block}
 Напиши 2–3 предложения: почему этот ход сильный/слабый, что он изменил в позиции.
 Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения.
+Используй ТОЛЬКО данные о пешечной структуре из раздела выше — не определяй проходные/изолированные/сдвоенные пешки самостоятельно.
 НЕ пиши числовые оценки движка. Объясняй по-человечески: какая угроза, какая слабость.
 Называй игроков по фамилии. Без заголовков и markdown."""
 
@@ -1061,6 +1212,9 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
 - Переломные моменты описывай через действие игрока, не через цифры оценки движка. НЕ ПИШИ числовые оценки вроде "+0.86" или "-3.03". Вместо этого: "Накамура выпустил перевес", "Гири перехватил инициативу", "позиция уравнялась"
 - Конкретный ход можно назвать, но объясняй его смысл по-человечески
 - НЕ описывай фигуры на доске и их расположение — это не нужно для итогов
+- ВАЖНО: следи за логикой "кто ошибся → кто получил перевес → кто не сконвертировал". Если игрок А ошибся — перевес у игрока Б. Если перевес не сконвертирован — это не сконвертировал игрок Б, а не А. Не путай субъекта действия
+- ВАЖНО: не используй выражение "взял чёрными/белыми" — оно читается как "победил". Пиши: "играл чёрными", "вёл белые фигуры", "игравший чёрными"
+- Если несколько партий тура начались одним и тем же дебютом — обыграй это: "Второй Каталон тура...", "Ещё одна Защита Нимцовича..." и т.п.
 - В конце — 1–2 фразы о турнирной интриге с ТОЧНЫМИ очками из таблицы выше
 - Шахматные термины на русском
 - Без заголовков (#), без маркированных списков, без markdown
@@ -1087,7 +1241,9 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
 
 async def get_tournament_h2h() -> dict[tuple[str, str], dict]:
     """Собрать реальные результаты H2H из уже сыгранных раундов этого турнира.
-    Возвращает {(white, black): {"w_pts": float, "b_pts": float, "games": int}}."""
+    Ключ — каноническая пара (sorted), значение — очки каждого + число партий.
+    Возвращает {(playerA, playerB): {"pts": {playerA: float, playerB: float}, "games": int}}.
+    """
     h2h: dict[tuple[str, str], dict] = {}
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         for rid, _ in KNOWN_ROUND_IDS:
@@ -1104,17 +1260,19 @@ async def get_tournament_h2h() -> dict[tuple[str, str], dict]:
                     gd = pgn_to_game_data(pgn)
                     w, b = gd["white"]["username"], gd["black"]["username"]
                     res = gd.get("result", "*")
-                    key = (w, b)
+                    # Каноническая пара — сортированная, чтобы (Гири, Есипенко) и
+                    # (Есипенко, Гири) попадали в одну запись
+                    key = tuple(sorted([w, b]))
                     if key not in h2h:
-                        h2h[key] = {"w_pts": 0.0, "b_pts": 0.0, "games": 0}
+                        h2h[key] = {"pts": {key[0]: 0.0, key[1]: 0.0}, "games": 0}
                     h2h[key]["games"] += 1
                     if res == "1-0":
-                        h2h[key]["w_pts"] += 1.0
+                        h2h[key]["pts"][w] += 1.0
                     elif res == "0-1":
-                        h2h[key]["b_pts"] += 1.0
+                        h2h[key]["pts"][b] += 1.0
                     elif res == "1/2-1/2":
-                        h2h[key]["w_pts"] += 0.5
-                        h2h[key]["b_pts"] += 0.5
+                        h2h[key]["pts"][w] += 0.5
+                        h2h[key]["pts"][b] += 0.5
             except Exception:
                 pass
     return h2h
@@ -1130,10 +1288,12 @@ async def get_round_preview(pairs: list[tuple[str, str]]) -> str:
     # Строим блок с данными для каждой пары
     pairs_lines = []
     for w, b in pairs:
-        key = (w, b)
+        key = tuple(sorted([w, b]))
         if key in tournament_h2h:
             d = tournament_h2h[key]
-            score_line = f"в этом турнире: {d['w_pts']}:{d['b_pts']} ({d['games']} партий)"
+            w_pts = d["pts"].get(w, 0.0)
+            b_pts = d["pts"].get(b, 0.0)
+            score_line = f"в этом турнире: {w_pts}:{b_pts} ({d['games']} партий)"
         else:
             score_line = "в этом турнире ещё не встречались"
         pairs_lines.append(f"• {w} (белые) – {b} (чёрные) | {score_line}")
@@ -1231,9 +1391,11 @@ async def check_pre_round_announcement(bot: Bot):
 
 
 async def send_pulse_update(bot: Bot, game_data: dict, pgn: str, label: str,
-                           eval_data: dict | None = None, clock_info: dict | None = None):
+                           eval_data: dict | None = None, clock_info: dict | None = None,
+                           tag: str = "📍"):
     """Короткий пульс-апдейт: оценка + часы + 2 предложения Claude.
-    eval_data и clock_info можно передать извне чтобы не гонять Stockfish повторно."""
+    eval_data и clock_info можно передать извне чтобы не гонять Stockfish повторно.
+    tag: эмодзи-префикс (📍 для Open, ♛ для Women)."""
     white = game_data["white"]["username"]
     black = game_data["black"]["username"]
 
@@ -1262,6 +1424,8 @@ async def send_pulse_update(bot: Bot, game_data: dict, pgn: str, label: str,
         time_note = "По времени примерно равны"
 
     piece_list = fen_to_piece_list(fen, white, black)
+    pawn_info = analyze_pawn_structure(fen) if fen else ""
+    pawn_block = f"\nПешечная структура (точные данные):\n{pawn_info}\n" if pawn_info else ""
     prompt = f"""Ты — шахматный комментатор, пишешь короткий апдейт для Telegram-канала о турнире претендентов 2026.
 
 Партия: {white} (белые) – {black} (чёрные), идёт {label}
@@ -1271,8 +1435,9 @@ async def send_pulse_update(bot: Bot, game_data: dict, pgn: str, label: str,
 Последние ходы: {moves}
 Фигуры на доске (точные данные):
 {piece_list}
-
+{pawn_block}
 Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения.
+Используй ТОЛЬКО данные о пешечной структуре из раздела выше (проходные, изолированные, сдвоенные) — не определяй их самостоятельно.
 Ровно 2 предложения: что сейчас происходит на доске и кто выглядит лучше.
 Без воды, только факт + оценка. Без заголовков и markdown."""
 
@@ -1282,7 +1447,7 @@ async def send_pulse_update(bot: Bot, game_data: dict, pgn: str, label: str,
     )
     commentary = _trim_to_sentence(r.content[0].text)
 
-    msg = (f"📍 *{white} — {black}* | {label}\n"
+    msg = (f"{tag} *{white} — {black}* | {label}\n"
            f"Ход {eval_data['move_count']} | Оценка: `{eval_data['eval_str']}`\n"
            f"⏱ {white}: `{wr}` | {black}: `{br}`\n\n"
            f"{commentary}")
@@ -1351,9 +1516,9 @@ def format_event_msg(game_data: dict, eval_data: dict, event_type: str,
 
 # ─── ТАБЛИЦА ОЧКОВ ────────────────────────────────────────────
 async def calculate_standings() -> tuple[dict[str, float], int]:
-    """Собрать очки всех игроков по всем сыгранным раундам.
+    """Собрать очки игроков Open турнира по всем сыгранным раундам.
     Возвращает (points, rounds_played)."""
-    points: dict[str, float] = {name: 0.0 for name in PLAYER_NAMES_RU.values()}
+    points: dict[str, float] = {name: 0.0 for name in OPEN_PLAYERS_RU}
     rounds_played = 0
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         for rid, rname in KNOWN_ROUND_IDS:
@@ -1426,10 +1591,347 @@ async def cmd_standings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_standings(bot, chat_id)
 
 
+# ═══ ЖЕНСКИЙ ТУРНИР — ОБЛЕГЧЁННЫЙ МОНИТОРИНГ ══════════════════
+
+async def get_women_active_round_id() -> tuple[str | None, str | None]:
+    """Найти активный раунд женского турнира (аналог get_active_round_id)."""
+    latest_finished = None
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        for rid, rname in reversed(WOMEN_KNOWN_ROUND_IDS):
+            try:
+                r = await client.get(
+                    f"https://lichess.org/api/broadcast/round/{rid}.pgn",
+                    headers={"User-Agent": "CandidatesBot/1.0"}
+                )
+                if r.status_code == 200 and r.text.strip():
+                    games = split_pgn(r.text)
+                    if not games:
+                        continue
+                    started = [g for g in games if count_moves_pgn(g) > 0]
+                    if not started:
+                        continue
+                    finished_count = sum(1 for g in games if is_game_finished(g))
+                    if finished_count < len(games):
+                        return rid, rname
+                    if latest_finished is None:
+                        latest_finished = (rid, rname)
+                elif r.status_code == 404:
+                    continue
+            except Exception:
+                pass
+    if latest_finished:
+        return latest_finished
+    if WOMEN_KNOWN_ROUND_IDS:
+        return WOMEN_KNOWN_ROUND_IDS[-1]
+    return None, None
+
+
+async def discover_women_rounds():
+    """Найти недостающие раунды женского турнира через Lichess Broadcast API.
+    Lichess GET /api/broadcast/{seriesId} → JSON {tour: {...}, rounds: [...]}.
+    Имена раундов приходят на русском: "Раунд 1", "Раунд 2" и т.д.
+    Вызывается при старте бота и периодически из monitoring_loop."""
+    import json as _json
+    known_ids = {rid for rid, _ in WOMEN_KNOWN_ROUND_IDS}
+    found_new = False
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            r = await client.get(
+                f"https://lichess.org/api/broadcast/{WOMEN_BROADCAST_ID}",
+                headers={"User-Agent": "CandidatesBot/1.0", "Accept": "application/json"}
+            )
+            print(f"[Women] discover_rounds: HTTP {r.status_code}, {len(r.text)} bytes")
+            if r.status_code != 200:
+                return
+            data = _json.loads(r.text)
+            rounds_list = data.get("rounds", [])
+            for rd in rounds_list:
+                rid = rd.get("id", "")
+                rname = rd.get("name", "")  # "Раунд 1", "Раунд 12" и т.д.
+                if not rid or rid in known_ids or rid == WOMEN_BROADCAST_ID:
+                    continue
+                # Нормализуем имя: "Раунд 12" → "Round 12" для совместимости
+                m = re.search(r'(\d+)', rname)
+                if m:
+                    rname = f"Round {m.group(1)}"
+                WOMEN_KNOWN_ROUND_IDS.append((rid, rname))
+                known_ids.add(rid)
+                found_new = True
+                print(f"[Women] Обнаружен новый раунд: {rname} ({rid})")
+            if found_new:
+                def round_sort_key(item):
+                    m = re.search(r'(\d+)', item[1])
+                    return int(m.group(1)) if m else 999
+                WOMEN_KNOWN_ROUND_IDS.sort(key=round_sort_key)
+            print(f"[Women] Всего раундов: {len(WOMEN_KNOWN_ROUND_IDS)}")
+    except Exception as e:
+        print(f"[Women] discover_rounds error: {e}")
+
+
+async def women_calculate_standings() -> tuple[dict[str, float], int]:
+    """Таблица женского турнира."""
+    points: dict[str, float] = {name: 0.0 for name in WOMEN_PLAYERS_RU}
+    rounds_played = 0
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        for rid, _ in WOMEN_KNOWN_ROUND_IDS:
+            try:
+                r = await client.get(
+                    f"https://lichess.org/api/broadcast/round/{rid}.pgn",
+                    headers={"User-Agent": "CandidatesBot/1.0"}
+                )
+                if r.status_code != 200 or not r.text.strip():
+                    continue
+                games = split_pgn(r.text)
+                all_finished = all(is_game_finished(g) for g in games)
+                if not all_finished:
+                    continue
+                rounds_played += 1
+                for pgn in games:
+                    gd = pgn_to_game_data(pgn)
+                    w, b = gd["white"]["username"], gd["black"]["username"]
+                    res = gd.get("result", "*")
+                    points.setdefault(w, 0.0)
+                    points.setdefault(b, 0.0)
+                    if res == "1-0":
+                        points[w] += 1.0
+                    elif res == "0-1":
+                        points[b] += 1.0
+                    elif res == "1/2-1/2":
+                        points[w] += 0.5
+                        points[b] += 0.5
+            except Exception:
+                pass
+    return points, rounds_played
+
+
+async def send_women_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
+    """Итоги тура женского турнира — тот же формат, но с меткой ♛."""
+    results_lines = []
+    results_for_claude = []
+    loop = asyncio.get_event_loop()
+
+    for pgn in games_pgn:
+        gd = pgn_to_game_data(pgn)
+        w, b = gd["white"]["username"], gd["black"]["username"]
+        res = get_game_result(pgn)
+        info = extract_opening_info(pgn)
+        n_moves = count_moves_pgn(pgn)
+        n_moves_str = str(n_moves) if n_moves else "?"
+        opening = info.get("opening") or info.get("eco") or "неизвестно"
+        first_moves = " ".join(info.get("first_moves", [])[:6])
+        if res == "1-0":
+            result_line = f"⚪️ 1-0 *{w} – {b}* ({n_moves_str} ходов)"
+        elif res == "0-1":
+            result_line = f"⚫️ 0-1 *{w} – {b}* ({n_moves_str} ходов)"
+        else:
+            result_line = f"🤝 ½-½ *{w} – {b}* ({n_moves_str} ходов)"
+        results_lines.append(result_line)
+
+        tps = await loop.run_in_executor(None, find_turning_points, pgn)
+        tp_descs = []
+        for tp in tps:
+            ev_before = float(tp['eval_before'])
+            ev_after = float(tp['eval_after'])
+            delta = ev_after - ev_before
+            side = tp['color']
+            move_san = f"{tp['move_num']}. {tp['san']}" if side == "белых" else f"{tp['move_num']}...{tp['san']}"
+            who = w if side == "белых" else b
+            if side == "белых":
+                if delta > 0.5:
+                    action = f"{who} усилил позицию ходом {move_san}"
+                elif delta < -0.5:
+                    action = f"{who} ошибся ходом {move_san}"
+                else:
+                    action = f"ход {move_san} ({who}) стал поворотным"
+            else:
+                if delta < -0.5:
+                    action = f"{who} нашёл сильный ход {move_san}"
+                elif delta > 0.5:
+                    action = f"{who} ошибся ходом {move_san}"
+                else:
+                    action = f"ход {move_san} ({who}) стал поворотным"
+
+            if abs(ev_before) >= 2.0 and abs(ev_after) < 0.8:
+                consequence = "преимущество упущено, позиция уравнялась"
+            elif abs(ev_before) >= 2.0 and abs(ev_after) >= 0.8:
+                consequence = "преимущество заметно сократилось"
+            elif abs(ev_before) < 0.8 and abs(ev_after) >= 2.0:
+                consequence = "позиция из равной стала решающей"
+            elif abs(ev_before) < 0.8 and abs(ev_after) < 0.8:
+                consequence = "позиция осталась примерно равной"
+            else:
+                consequence = "оценка заметно изменилась"
+            tp_descs.append(f"{action} — {consequence}")
+
+        tp_info = ""
+        if len(tp_descs) == 1:
+            tp_info = f" Ключевой момент: {tp_descs[0]}."
+        elif len(tp_descs) >= 2:
+            tp_info = f" Ключевые моменты: 1) {tp_descs[0]}; 2) {tp_descs[1]}."
+
+        results_for_claude.append(
+            f"• {w} (белые) vs {b} (чёрные): {res}, {n_moves_str} ходов. "
+            f"Дебют: {opening}. Первые ходы: {first_moves}.{tp_info}"
+        )
+
+    try:
+        points, rounds_played = await women_calculate_standings()
+        sorted_pts = sorted(points.items(), key=lambda x: -x[1])
+        standings_text = ", ".join(f"{n} {p}" for n, p in sorted_pts if p > 0)
+    except Exception:
+        standings_text = "(таблица недоступна)"
+
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    prompt = f"""Ты пишешь итоги {round_name} женского турнира претендентов 2026 для русскоязычного шахматного Telegram-канала.
+
+Результаты:
+{chr(10).join(results_for_claude)}
+
+Таблица после этого тура: {standings_text}
+
+Стиль — как у chess.com или ChessBase, но на русском:
+- Пиши как спортивный журналист: короткие фактические предложения, живой язык
+- 2–3 предложения на каждую партию: название дебюта, переломный момент (используй данные выше), характер борьбы
+- Переломные моменты описывай через действие игрока, не через цифры оценки движка. НЕ ПИШИ числовые оценки вроде "+0.86" или "-3.03". Вместо этого: "выпустила перевес", "перехватила инициативу", "позиция уравнялась"
+- Конкретный ход можно назвать, но объясняй его смысл по-человечески
+- НЕ описывай фигуры на доске и их расположение — это не нужно для итогов
+- ВАЖНО: следи за логикой "кто ошибся → кто получил перевес → кто не сконвертировал". Не путай субъекта действия
+- ВАЖНО: не используй выражение "взяла чёрными/белыми" — оно читается как "победила". Пиши: "играла чёрными", "вела белые фигуры"
+- Если несколько партий тура начались одним и тем же дебютом — обыграй это
+- Используй женский род глаголов для игроков: "играла", "ошиблась", "нашла", "выиграла"
+- В конце — 1–2 фразы о турнирной интриге с ТОЧНЫМИ очками из таблицы выше
+- Шахматные термины на русском
+- Без заголовков (#), без маркированных списков, без markdown
+- В самом конце новой строкой: #турнир_претенденток
+- Не упоминай что ты ИИ"""
+
+    r = client.messages.create(
+        model="claude-sonnet-4-6", max_tokens=700,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    analysis = _trim_to_sentence(r.content[0].text)
+    analysis = re.sub(r'^#+\s+', '', analysis, flags=re.MULTILINE)
+
+    results_block = "\n".join(results_lines)
+    msg = (f"♛ *{round_name} Women — итоги*\n\n"
+           f"{results_block}\n\n"
+           f"{analysis}")
+    await send_update(bot, msg)
+
+
+async def women_monitoring_step(bot: Bot, now: float):
+    """Один шаг облегчённого мониторинга женского турнира.
+    Вызывается из monitoring_loop каждые 5 минут.
+    Обрабатывает: превью тура, пульсы (1ч, 2ч), итоги тура."""
+    global w_last_discover_ts
+    try:
+        # Периодически обновляем список раундов (раз в 6 часов)
+        if now - w_last_discover_ts > 21600:
+            w_last_discover_ts = now
+            await discover_women_rounds()
+
+        round_id, round_name = await get_women_active_round_id()
+        if not round_id:
+            return
+
+        games_pgn, pgn_debug = await get_round_pgns(round_id)
+        print(f"[Women] {round_name} ({round_id}): {pgn_debug}")
+
+        if not games_pgn:
+            return
+
+        pgn_move_counts = {p: count_moves_pgn(p) for p in games_pgn}
+        pgn_is_finished = {p: is_game_finished(p) for p in games_pgn}
+
+        # ── Анонс нового раунда (одно сообщение с парами) ──
+        games_started = [p for p in games_pgn if pgn_move_counts[p] > 0]
+        if (games_started
+                and round_id not in w_announced_rounds
+                and not all(pgn_is_finished[p] for p in games_pgn)):
+            w_announced_rounds.add(round_id)
+            max_moves = max(pgn_move_counts[p] for p in games_started)
+            if max_moves <= 5:
+                # Простой анонс без Claude — список пар
+                pairs_lines = []
+                for pgn in games_pgn:
+                    gd = pgn_to_game_data(pgn)
+                    w, b = gd["white"]["username"], gd["black"]["username"]
+                    pairs_lines.append(f"• {w} — {b}")
+                msg = f"♛ *{round_name} Women — начало*\n\n" + "\n".join(pairs_lines)
+                await send_update(bot, msg)
+            else:
+                print(f"[Women] {round_name} уже в процессе ({max_moves} ходов) — анонс пропущен")
+
+        # ── Пульс-апдейты и game_over для каждой партии ──
+        for pgn in games_pgn:
+            game_id = "w_" + pgn_game_id(pgn)   # префикс чтобы не путать с Open
+            game_data = pgn_to_game_data(pgn)
+            finished = pgn_is_finished[pgn]
+            mc = pgn_move_counts[pgn]
+
+            if mc == 0:
+                continue
+
+            # Запоминаем время старта
+            if game_id not in w_game_start_times:
+                scheduled_dt = WOMEN_ROUND_SCHEDULE.get(round_name)
+                if scheduled_dt and mc > 3:
+                    w_game_start_times[game_id] = scheduled_dt.timestamp()
+                else:
+                    w_game_start_times[game_id] = now
+                # Помечаем пройденные пульсы по реальному времени
+                real_elapsed = now - w_game_start_times[game_id]
+                sent = w_games_pulse_sent.setdefault(game_id, set())
+                for interval in WOMEN_PULSE_INTERVALS:
+                    if real_elapsed > interval + 300:
+                        sent.add(interval)
+
+            # Game over — отправить один раз (как в Open)
+            if finished and game_id not in w_games_over_sent:
+                w_games_over_sent.add(game_id)
+                eval_data = evaluate_position(pgn)
+                if eval_data:
+                    clock_info = analyze_clocks(pgn)
+                    commentary = get_gm_commentary(game_data, eval_data, "game_over", clock_info)
+                    msg = format_event_msg(game_data, eval_data, "game_over", commentary, clock_info)
+                    # Добавляем метку ♛ для женского турнира
+                    msg = "♛ " + msg
+                    await send_update_with_photo(bot, msg, pgn)
+
+            # Пульс-апдейты (1ч, 2ч) — со Stockfish для оценки
+            if not finished:
+                elapsed = now - w_game_start_times.get(game_id, now)
+                sent_pulses = w_games_pulse_sent.setdefault(game_id, set())
+                for interval in WOMEN_PULSE_INTERVALS:
+                    if elapsed >= interval and interval not in sent_pulses:
+                        sent_pulses.add(interval)
+                        label = WOMEN_PULSE_LABELS[interval]
+                        # Вызываем Stockfish только для пульсов
+                        eval_data = evaluate_position(pgn)
+                        if eval_data:
+                            clock_info = analyze_clocks(pgn)
+                            await send_pulse_update(
+                                bot, game_data, pgn, label,
+                                eval_data=eval_data, clock_info=clock_info,
+                                tag="♛"
+                            )
+
+        # ── Итоги тура — когда все партии завершены ──
+        if (games_pgn
+                and round_id not in w_round_summary_done
+                and len(games_pgn) >= 2
+                and all(pgn_is_finished[p] for p in games_pgn)):
+            w_round_summary_done.add(round_id)
+            await send_women_round_summary(bot, round_name, games_pgn)
+
+    except Exception as e:
+        print(f"[Women] Loop error: {e}")
+
+
 # ─── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────
 async def monitoring_loop(bot: Bot):
     """Основной цикл мониторинга партий."""
-    print("✅ Мониторинг запущен. Слежу за турниром претендентов 2026...")
+    print("✅ Мониторинг запущен. Слежу за турниром претендентов 2026 (Open + Women)...")
 
     while True:
         try:
@@ -1477,22 +1979,28 @@ async def monitoring_loop(bot: Bot):
                 if not eval_data:
                     continue
 
-                # Запоминаем момент первого обнаружения партии.
-                # Используем move_count из уже посчитанного eval_data — без лишнего вызова.
+                # Запоминаем момент старта партии.
+                # При перезапуске бота используем реальное время из расписания,
+                # а не момент обнаружения — иначе пульсы теряются.
                 if game_id not in game_start_times:
-                    game_start_times[game_id] = now
-                    # Бот мог перезапуститься в середине партии — помечаем уже
-                    # пройденные этапы по числу ходов, чтобы не дублировать сообщения
+                    scheduled_dt = ROUND_SCHEDULE.get(round_name)
+                    if scheduled_dt and eval_data["move_count"] > 3:
+                        # Партия уже в процессе — используем реальное время старта
+                        game_start_times[game_id] = scheduled_dt.timestamp()
+                    else:
+                        game_start_times[game_id] = now
+                    # Бот мог перезапуститься — помечаем уже пройденные этапы
+                    # по реально прошедшему времени (не по числу ходов!)
+                    real_elapsed = now - game_start_times[game_id]
                     mc = eval_data["move_count"]
-                    if mc > 12:
+                    if mc > 12 or real_elapsed > OPENING_STATUS_DELAY:
                         games_15min_done.add(game_id)
                     sent = games_pulse_sent.setdefault(game_id, set())
-                    if mc > 20:
-                        sent.add(3600)
-                    if mc > 38:
-                        sent.add(7200)
-                    if mc > 52:
-                        sent.add(10800)
+                    for interval in PULSE_INTERVALS:
+                        if real_elapsed > interval + 300:
+                            # +300 сек (5 мин) буфер: если мы чуть позже —
+                            # пульс уже точно был отправлен ранее
+                            sent.add(interval)
 
                 prev = seen_games.get(game_id)
                 event_type = None
@@ -1576,6 +2084,12 @@ async def monitoring_loop(bot: Bot):
         except Exception as e:
             print(f"Loop error: {e}")
 
+        # ── Женский турнир — облегчённый мониторинг ──
+        try:
+            await women_monitoring_step(bot, time.time())
+        except Exception as e:
+            print(f"[Women] Step error: {e}")
+
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
@@ -1589,7 +2103,9 @@ async def main():
     async with app:
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
-        print("✅ Бот запущен (мониторинг + команды)")
+        # Автодетект раундов женского турнира при старте
+        await discover_women_rounds()
+        print(f"✅ Бот запущен (Open + Women, {len(WOMEN_KNOWN_ROUND_IDS)} women rounds)")
         # Параллельно запускаем мониторинг
         await monitoring_loop(bot)
         # monitoring_loop бесконечный — до сюда не доходим при штатной работе
