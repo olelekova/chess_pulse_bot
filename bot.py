@@ -161,6 +161,7 @@ announced_rounds    = set()  # round_id → объявили старт тура
 pre_announced_rounds = set()  # round_name → отправили превью до начала тура
 round_summary_done  = set()  # round_id → уже отправили итог тура
 games_pulse_sent    = {}   # game_id → set(секунд) уже отправленных пульс-апдейтов
+games_eval_history  = {}   # game_id → list[(move_count, eval_num)] — история оценок для контекста
 
 # ─── СОСТОЯНИЕ (Women) ───────────────────────────────────────
 w_game_start_times     = {}      # game_id → timestamp
@@ -838,7 +839,8 @@ def _trim_to_sentence(text: str) -> str:
 
 
 def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
-                      clock_info: dict | None = None) -> str:
+                      clock_info: dict | None = None,
+                      eval_history: list | None = None) -> str:
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
     white = game_data["white"]["username"]
     black = game_data["black"]["username"]
@@ -880,6 +882,26 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
         elif event_type == "eval_swing":
             if abs(ev) >= 2.0:
                 missed_note = f"\nСитуация становится критической — {position_desc}."
+
+        # История оценок для game_over — чтобы Claude знал драматургию партии
+        history_note = ""
+        if event_type == "game_over" and eval_history:
+            max_ev = max(h[1] for h in eval_history)
+            min_ev = min(h[1] for h in eval_history)
+            if max_ev >= 1.5:
+                max_move = next(h[0] for h in eval_history if h[1] == max_ev)
+                history_note += f"\nВ какой-то момент (ход ~{max_move}) у белых ({white}) было серьёзное преимущество."
+            if min_ev <= -1.5:
+                min_move = next(h[0] for h in eval_history if h[1] == min_ev)
+                history_note += f"\nВ какой-то момент (ход ~{min_move}) у чёрных ({black}) было серьёзное преимущество."
+            if max_ev >= 1.5 and abs(ev) < 0.8 and result_str == "1/2-1/2":
+                history_note += f"\nВАЖНО: преимущество белых было упущено — партия завершилась вничью. Укажи это!"
+            if min_ev <= -1.5 and abs(ev) < 0.8 and result_str == "1/2-1/2":
+                history_note += f"\nВАЖНО: преимущество чёрных было упущено — партия завершилась вничью. Укажи это!"
+            if max_ev >= 1.5 and result_str == "0-1":
+                history_note += f"\nИнтересно: у белых было преимущество, но выиграли чёрные — произошёл перелом!"
+            if min_ev <= -1.5 and result_str == "1-0":
+                history_note += f"\nИнтересно: у чёрных было преимущество, но выиграли белые — произошёл перелом!"
         event_desc = {
             "eval_swing": f"резкое изменение позиции — {position_desc}",
             "eval_swing_missed": f"преимущество упущено, {position_desc}",
@@ -898,7 +920,7 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
 Партия: {white} (белые) – {black} (чёрные)
 Ход: {eval_data['move_count']} | Лучший ход по движку: {eval_data['best_move']}
 Последние ходы: {moves}{time_note}
-Событие: {event_desc}{missed_note}
+Событие: {event_desc}{missed_note}{history_note}
 {piece_block}{pawn_block}
 Правила:
 - НЕ ПИШИ числовые оценки движка ("+1.5", "-2.3" и т.д.) — опиши ситуацию словами
@@ -1591,6 +1613,42 @@ async def cmd_standings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_standings(bot, chat_id)
 
 
+async def send_women_standings(bot: Bot, chat_id: str | int):
+    """Отправить текущую таблицу женского турнира."""
+    try:
+        points, rounds_played = await women_calculate_standings()
+    except Exception as e:
+        await bot.send_message(chat_id=chat_id, text=f"Ошибка получения таблицы: {e}")
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    sorted_players = sorted(points.items(), key=lambda x: -x[1])
+
+    lines = []
+    prev_pts = None
+    rank = 0
+    display_rank = 0
+    for name, pts in sorted_players:
+        rank += 1
+        if pts != prev_pts:
+            display_rank = rank
+        prev_pts = pts
+        medal = medals[display_rank - 1] if display_rank <= 3 else f"{display_rank}."
+        pts_str = str(int(pts)) if pts == int(pts) else str(pts)
+        lines.append(f"{medal} *{name}* — {pts_str}")
+
+    rounds_str = f"после {rounds_played} туров" if rounds_played else "турнир ещё не начался"
+    msg = f"♛ *Таблица Претенденток 2026* ({rounds_str})\n\n" + "\n".join(lines)
+    await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+
+
+async def cmd_standings_women(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/standings_women — таблица женского турнира."""
+    bot = context.bot
+    chat_id = update.effective_chat.id
+    await send_women_standings(bot, chat_id)
+
+
 # ═══ ЖЕНСКИЙ ТУРНИР — ОБЛЕГЧЁННЫЙ МОНИТОРИНГ ══════════════════
 
 async def get_women_active_round_id() -> tuple[str | None, str | None]:
@@ -1817,6 +1875,9 @@ async def send_women_round_summary(bot: Bot, round_name: str, games_pgn: list[st
            f"{results_block}\n\n"
            f"{analysis}")
     await send_update(bot, msg)
+    # Автоматически показать таблицу очков после итогов тура
+    await asyncio.sleep(2)
+    await send_women_standings(bot, TELEGRAM_CHAT_ID)
 
 
 async def women_monitoring_step(bot: Bot, now: float):
@@ -2043,7 +2104,9 @@ async def monitoring_loop(bot: Bot):
 
                 if event_type:
                     clock_info = analyze_clocks(pgn)
-                    commentary = get_gm_commentary(game_data, eval_data, event_type, clock_info)
+                    hist = games_eval_history.get(game_id)
+                    commentary = get_gm_commentary(game_data, eval_data, event_type, clock_info,
+                                                   eval_history=hist)
                     msg = format_event_msg(game_data, eval_data, event_type, commentary, clock_info)
                     await send_update_with_photo(bot, msg, pgn)
                     # Разбор переломного момента теперь включён в итоги тура (send_round_summary)
@@ -2051,6 +2114,9 @@ async def monitoring_loop(bot: Bot):
                     games_baseline_eval[game_id] = eval_data
 
                 seen_games[game_id] = eval_data
+                # Записываем историю оценок для контекста game_over
+                hist = games_eval_history.setdefault(game_id, [])
+                hist.append((eval_data["move_count"], eval_data["eval_num"]))
 
                 # ── 15-минутный анализ дебюта ──────────────────
                 elapsed = now - game_start_times.get(game_id, now)
@@ -2097,6 +2163,7 @@ async def main():
     # Приложение с поддержкой команд
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("standings", cmd_standings))
+    app.add_handler(CommandHandler("standings_women", cmd_standings_women))
 
     bot = app.bot
 
