@@ -19,6 +19,8 @@ import httpx
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from anthropic import Anthropic
+from commentary_prompts import build_prompt, SYSTEM_PROMPT, get_position_analysis
+from tournaments_config import load_tournaments, get_active_tournaments
 
 # ─── НАСТРОЙКИ ────────────────────────────────────────────────
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
@@ -198,6 +200,75 @@ TOURNAMENT_PROFILES = {
         "emoji":              "♛",
     },
 }
+
+# ─── YAML OVERRIDE: подменяем Open-константы из tournaments.yaml ──────
+# Если в tournaments.yaml есть активный сегодня турнир (отличный от женского
+# Кандидатов, у которого свой код-путь) — подставляем его данные в Open-слот.
+# Это делает bot.py универсальным: меняем YAML → бот покрывает новый турнир.
+#
+# Хардкод-константы выше остаются как fallback на случай ошибки чтения YAML.
+def _build_round_schedule(profile: dict) -> dict:
+    """Распределить туры профиля по дням от start_date, пропуская rest_days.
+    Время старта берётся из profile['params']['round_start_utc'] (HH:MM, UTC).
+    Возвращает {round_name: datetime_utc}."""
+    h, m = map(int, str(profile["params"].get("round_start_utc", "12:30")).split(":"))
+    rest = set(profile["rest_days"])
+    cur = profile["start_date"]
+    schedule = {}
+    for _, round_name in profile["round_ids"]:
+        while cur.isoformat() in rest:
+            cur = cur + datetime.timedelta(days=1)
+        schedule[round_name] = datetime.datetime(
+            cur.year, cur.month, cur.day, h, m, tzinfo=_UTC
+        )
+        cur = cur + datetime.timedelta(days=1)
+    return schedule
+
+
+try:
+    _YAML_CFG = load_tournaments()
+    _today_utc = datetime.datetime.now(_UTC).date()
+    _active_yaml = get_active_tournaments(_YAML_CFG, _today_utc)
+    # Берём первый активный турнир, который НЕ женские Кандидаты
+    # (у women свой собственный код-путь и константы).
+    _main_profile = next(
+        (p for tid, p in _active_yaml.items() if tid != "women_candidates_2026"),
+        None,
+    )
+    if _main_profile:
+        print(f"[YAML] Активный турнир в Open-слоте: "
+              f"{_main_profile['display_name']} ({_main_profile['id']})")
+        LICHESS_BROADCAST_ID = _main_profile["broadcast_id"] or LICHESS_BROADCAST_ID
+        KNOWN_ROUND_IDS      = list(_main_profile["round_ids"])
+        REST_DAYS            = set(_main_profile["rest_days"])
+        ROUND_SCHEDULE       = _build_round_schedule(_main_profile)
+        # Имена игроков — добавляем поверх существующего словаря
+        for _surname, _info in _main_profile["players"].items():
+            PLAYER_NAMES_RU[_surname] = _info["ru"]
+            if _info.get("chess_com"):
+                PLAYER_CHESS_COM[_surname] = _info["chess_com"]
+        OPEN_PLAYERS_RU = {info["ru"] for info in _main_profile["players"].values()}
+        # Профиль алгоритмов
+        TOURNAMENT_PROFILES["open"].update({
+            **_main_profile["algorithms"],
+            "display_name":  _main_profile["display_name"],
+            "emoji":         _main_profile["emoji"],
+            "qualifies_for": _main_profile["qualifies_for"],
+            "total_rounds":  _main_profile["total_rounds"],
+        })
+        # Пульс-интервалы (если профиль их даёт)
+        if _main_profile["params"].get("pulse_intervals"):
+            PULSE_INTERVALS = list(_main_profile["params"]["pulse_intervals"])
+        # Порог eval_swing
+        if "eval_swing_threshold" in _main_profile["params"]:
+            EVAL_SWING_THRESHOLD = float(_main_profile["params"]["eval_swing_threshold"])
+        print(f"[YAML] broadcast={LICHESS_BROADCAST_ID}, "
+              f"rounds={len(KNOWN_ROUND_IDS)}, "
+              f"algos_on={sum(_main_profile['algorithms'].values())}/10")
+    else:
+        print("[YAML] нет активного турнира на сегодня — остаюсь на хардкоде")
+except Exception as _e:
+    print(f"[YAML] ошибка загрузки tournaments.yaml: {_e!r} — остаюсь на хардкоде")
 
 # ─── СОСТОЯНИЕ (Open) ─────────────────────────────────────────
 seen_games          = {}   # game_id → последний eval_data
@@ -935,7 +1006,6 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
     white = game_data["white"]["username"]
     black = game_data["black"]["username"]
-    moves = ', '.join(eval_data.get('moves_san', []))
 
     # Явная подсказка Claude о времени
     time_note = ""
@@ -948,22 +1018,8 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
             time_note = f"\nПо времени опережает {leader} (на ~{diff_min} мин)"
 
     if event_type in ("eval_swing", "eval_swing_missed", "game_over"):
-        result_str = game_data.get("result", "*")
-        result_ru = {"1-0": f"1-0 ({white})", "0-1": f"0-1 ({black})",
-                     "1/2-1/2": "½-½"}.get(result_str, "результат неизвестен")
-
-        # Качественное описание ситуации вместо числовой оценки
         ev = eval_data["eval_num"]
-        if abs(ev) < 0.5:
-            position_desc = "позиция примерно равная"
-        elif ev >= 0.5 and ev < 1.5:
-            position_desc = f"у белых ({white}) небольшой перевес"
-        elif ev >= 1.5:
-            position_desc = f"у белых ({white}) серьёзное преимущество"
-        elif ev <= -0.5 and ev > -1.5:
-            position_desc = f"у чёрных ({black}) небольшой перевес"
-        else:
-            position_desc = f"у чёрных ({black}) серьёзное преимущество"
+        result_str = game_data.get("result", "*")
 
         missed_note = ""
         if event_type == "eval_swing_missed":
@@ -972,9 +1028,12 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
             missed_note = f"\nВАЖНО: {missed_side} упустил(а) серьёзное преимущество! Позиция выровнялась. Укажи кто и как упустил."
         elif event_type == "eval_swing":
             if abs(ev) >= 2.0:
-                missed_note = f"\nСитуация становится критической — {position_desc}."
+                if ev >= 2.0:
+                    missed_note = f"\nСитуация критическая — у белых ({white}) серьёзное преимущество."
+                else:
+                    missed_note = f"\nСитуация критическая — у чёрных ({black}) серьёзное преимущество."
 
-        # История оценок для game_over — чтобы Claude знал драматургию партии
+        # История оценок для game_over
         history_note = ""
         if event_type == "game_over" and eval_history:
             max_ev = max(h[1] for h in eval_history)
@@ -985,6 +1044,8 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
             if min_ev <= -1.5:
                 min_move = next(h[0] for h in eval_history if h[1] == min_ev)
                 history_note += f"\nВ какой-то момент (ход ~{min_move}) у чёрных ({black}) было серьёзное преимущество."
+            result_ru = {"1-0": f"1-0 ({white})", "0-1": f"0-1 ({black})",
+                         "1/2-1/2": "½-½"}.get(result_str, "результат неизвестен")
             if max_ev >= 1.5 and abs(ev) < 0.8 and result_str == "1/2-1/2":
                 history_note += f"\nВАЖНО: преимущество белых было упущено — партия завершилась вничью. Укажи это!"
             if min_ev <= -1.5 and abs(ev) < 0.8 and result_str == "1/2-1/2":
@@ -993,83 +1054,37 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
                 history_note += f"\nИнтересно: у белых было преимущество, но выиграли чёрные — произошёл перелом!"
             if min_ev <= -1.5 and result_str == "1-0":
                 history_note += f"\nИнтересно: у чёрных было преимущество, но выиграли белые — произошёл перелом!"
-        event_desc = {
-            "eval_swing": f"резкое изменение позиции — {position_desc}",
-            "eval_swing_missed": f"преимущество упущено, {position_desc}",
-            "game_over":  f"партия завершена — {result_ru}",
-        }.get(event_type, event_type)
 
-        # Список фигур на доске — чтобы Claude не придумывал позиции
-        fen = eval_data.get("fen", "")
-        piece_list = fen_to_piece_list(fen, white, black) if fen else ""
-        piece_block = f"\nФигуры на доске:\n{piece_list}\n" if piece_list else ""
-        pawn_info = analyze_pawn_structure(fen) if fen else ""
-        pawn_block = f"\nПешечная структура (точные данные):\n{pawn_info}\n" if pawn_info else ""
-
-        # Название дебюта из PGN (если передано)
-        opening_line = ""
-        if opening_info:
-            op_name = opening_info.get("opening") or opening_info.get("eco") or ""
-            eco = opening_info.get("eco", "")
-            if op_name:
-                opening_line = f"\nДебют (из PGN): {op_name}" + (f" ({eco})" if eco and eco != op_name else "")
-
-        prompt = f"""Ты — шахматный комментатор турнира претендентов 2026, пишешь для Telegram-канала. Стиль — как у лучших шахматных журналистов: живой, конкретный, с характером.
-
-Партия: {white} (белые) – {black} (чёрные){opening_line}
-Ход: {eval_data['move_count']} | Лучший ход по движку: {eval_data['best_move']}
-Последние ходы: {moves}{time_note}
-Событие: {event_desc}{missed_note}{history_note}
-{piece_block}{pawn_block}
-Правила:
-- НЕ ПИШИ числовые оценки движка ("+1.5", "-2.3" и т.д.) — опиши ситуацию словами
-- Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения фигур
-- Используй ТОЛЬКО данные о пешечной структуре из раздела выше (проходные, изолированные, сдвоенные) — не определяй их самостоятельно
-- Назови конкретный ход если он ключевой и объясни почему он важен
-- 2–3 предложения: что случилось и что ожидать дальше. Коротко и по делу
-- Пиши уверенно, можно с иронией. Называй игроков по фамилии
-- Не упоминай что ты ИИ. Без заголовков и markdown. Только обычный текст."""
+        system, user = build_prompt(event_type,
+            white=white, black=black,
+            move_count=eval_data['move_count'],
+            best_move=eval_data['best_move'],
+            moves_san=eval_data.get('moves_san', []),
+            fen=eval_data.get("fen", ""),
+            eval_num=ev,
+            time_note=time_note,
+            missed_note=missed_note,
+            history_note=history_note,
+            opening_info=opening_info,
+        )
         max_tokens = 350
 
     else:
-        # Стиль: телеграфный — только факты, коротко и по делу
-        event_desc = {
-            "new_game": f"партия началась, ход {eval_data['move_count']}",
-            "novelty":  f"дебют завершился рано, ход {eval_data['move_count']}",
-        }.get(event_type, event_type)
-
-        # Список фигур для контекста (даже в дебюте — чтобы не выдумывать)
-        fen = eval_data.get("fen", "")
-        piece_list_ng = fen_to_piece_list(fen, white, black) if fen else ""
-        piece_block_ng = f"\nФигуры на доске:\n{piece_list_ng}\n" if piece_list_ng else ""
-        pawn_info_ng = analyze_pawn_structure(fen) if fen else ""
-        pawn_block_ng = f"\nПешечная структура (точные данные):\n{pawn_info_ng}\n" if pawn_info_ng else ""
-
-        # Название дебюта из PGN (если передано)
-        opening_line_ng = ""
-        if opening_info:
-            op_name = opening_info.get("opening") or opening_info.get("eco") or ""
-            eco = opening_info.get("eco", "")
-            if op_name:
-                opening_line_ng = f"\nДебют (из PGN): {op_name}" + (f" ({eco})" if eco and eco != op_name else "")
-
-        prompt = f"""Ты — шахматный комментатор турнира претендентов 2026, пишешь для Telegram-канала.
-
-Партия: {white} (белые) – {black} (чёрные){opening_line_ng}
-Ход: {eval_data['move_count']} | Лучший ход: {eval_data['best_move']}
-Последние ходы: {moves}{time_note}
-Событие: {event_desc}
-{piece_block_ng}{pawn_block_ng}
-Напиши 2–3 коротких предложения: охарактеризуй дебют (используй название из PGN если оно есть), чего ожидать от этой пары.
-Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения.
-Используй ТОЛЬКО данные о пешечной структуре из раздела выше — не определяй проходные/изолированные/сдвоенные пешки самостоятельно.
-Не пиши числовые оценки движка. Называй игроков по фамилии.
-Не упоминай что ты ИИ. Без заголовков и markdown."""
+        system, user = build_prompt(event_type,
+            white=white, black=black,
+            move_count=eval_data['move_count'],
+            best_move=eval_data['best_move'],
+            moves_san=eval_data.get('moves_san', []),
+            fen=eval_data.get("fen", ""),
+            time_note=time_note,
+            opening_info=opening_info,
+        )
         max_tokens = 220
 
     r = client.messages.create(
         model="claude-sonnet-4-6", max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}]
+        system=system,
+        messages=[{"role": "user", "content": user}]
     )
     return _trim_to_sentence(r.content[0].text)
 
@@ -1080,22 +1095,21 @@ async def get_opening_analysis(game_data: dict, opening_info: dict,
     white = game_data["white"]["username"]
     black = game_data["black"]["username"]
 
-    prompt = f"""Ты — гроссмейстер, анализируешь дебют на турнире претендентов 2026. Прошло 15 минут.
-
-Партия: {white} (белые) vs {black} (чёрные)
-Дебют: {opening_info.get('opening') or opening_info.get('eco') or 'неизвестен'} (ECO: {opening_info.get('eco','—')})
-Первые ходы: {' '.join(opening_info.get('first_moves',[])[:8])}
-Остаток времени: {white} — {opening_info.get('white_time_remaining','?')} | {black} — {opening_info.get('black_time_remaining','?')}
-
-Репертуар {white} за белых: {', '.join(white_rep[:10]) or 'нет данных'}
-Репертуар {black} за чёрных: {', '.join(black_rep[:10]) or 'нет данных'}
-
-3 предложения максимум: свой ли дебют для каждого, кто выглядит увереннее и что говорит расход времени.
-Никакой воды. Пиши по-русски, без заголовков, без списков, без markdown-форматирования. Только обычный текст. Не упоминай что ты ИИ."""
+    system, user = build_prompt("opening_analysis",
+        white=white, black=black,
+        opening=opening_info.get('opening') or opening_info.get('eco') or 'неизвестен',
+        eco=opening_info.get('eco', '—'),
+        first_moves=opening_info.get('first_moves', []),
+        white_time=opening_info.get('white_time_remaining', '?'),
+        black_time=opening_info.get('black_time_remaining', '?'),
+        white_rep=white_rep,
+        black_rep=black_rep,
+    )
 
     r = client.messages.create(
         model="claude-sonnet-4-6", max_tokens=280,
-        messages=[{"role": "user", "content": prompt}]
+        system=system,
+        messages=[{"role": "user", "content": user}]
     )
     return _trim_to_sentence(r.content[0].text)
 
@@ -1115,7 +1129,6 @@ async def get_turning_point_commentary(game_data: dict, tp: dict, result: str) -
     who = white if side == "белых" else black
     move_san = f"{tp['move_num']}. {tp['san']}" if side == "белых" else f"{tp['move_num']}...{tp['san']}"
 
-    # Определяем что произошло
     if side == "белых" and delta > 0.5:
         what_happened = f"{who} усилил позицию ходом {move_san}"
     elif side == "белых" and delta < -0.5:
@@ -1127,27 +1140,17 @@ async def get_turning_point_commentary(game_data: dict, tp: dict, result: str) -
     else:
         what_happened = f"ход {move_san} стал поворотным моментом"
 
-    # Список фигур на доске после переломного хода
-    tp_fen = tp.get("fen", "")
-    tp_piece_list = fen_to_piece_list(tp_fen, white, black) if tp_fen else ""
-    tp_piece_block = f"\nФигуры на доске после этого хода:\n{tp_piece_list}\n" if tp_piece_list else ""
-    tp_pawn_info = analyze_pawn_structure(tp_fen) if tp_fen else ""
-    tp_pawn_block = f"\nПешечная структура (точные данные):\n{tp_pawn_info}\n" if tp_pawn_info else ""
-
-    prompt = f"""Ты — шахматный комментатор, пишешь разбор хода для Telegram-канала о турнире претендентов 2026.
-
-Партия: {white} (белые) – {black} (чёрные), результат: {result_ru}
-Что произошло: {what_happened}
-{tp_piece_block}{tp_pawn_block}
-Напиши 2–3 предложения: почему этот ход сильный/слабый, что он изменил в позиции.
-Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения.
-Используй ТОЛЬКО данные о пешечной структуре из раздела выше — не определяй проходные/изолированные/сдвоенные пешки самостоятельно.
-НЕ пиши числовые оценки движка. Объясняй по-человечески: какая угроза, какая слабость.
-Называй игроков по фамилии. Без заголовков и markdown."""
+    system, user = build_prompt("turning_point",
+        white=white, black=black,
+        result_ru=result_ru,
+        what_happened=what_happened,
+        fen=tp.get("fen", ""),
+    )
 
     r = client.messages.create(
         model="claude-sonnet-4-6", max_tokens=300,
-        messages=[{"role": "user", "content": prompt}]
+        system=system,
+        messages=[{"role": "user", "content": user}]
     )
     return _trim_to_sentence(r.content[0].text)
 
@@ -1326,33 +1329,19 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
     except Exception:
         standings_text = "(таблица недоступна)"
 
-    # Claude-разбор в стиле шахматного Telegram-канала
+    # Claude-разбор с голосом Полгар+Сейраван
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    prompt = f"""Ты пишешь итоги {round_name} турнира претендентов 2026 для русскоязычного шахматного Telegram-канала.
-
-Результаты:
-{chr(10).join(results_for_claude)}
-
-Таблица после этого тура: {standings_text}
-
-Стиль — как у chess.com или ChessBase, но на русском:
-- Пиши как спортивный журналист: короткие фактические предложения, живой язык
-- 2–3 предложения на каждую партию: название дебюта, переломный момент (используй данные выше), характер борьбы
-- Переломные моменты описывай через действие игрока, не через цифры оценки движка. НЕ ПИШИ числовые оценки вроде "+0.86" или "-3.03". Вместо этого: "Накамура выпустил перевес", "Гири перехватил инициативу", "позиция уравнялась"
-- Конкретный ход можно назвать, но объясняй его смысл по-человечески
-- НЕ описывай фигуры на доске и их расположение — это не нужно для итогов
-- ВАЖНО: следи за логикой "кто ошибся → кто получил перевес → кто не сконвертировал". Если игрок А ошибся — перевес у игрока Б. Если перевес не сконвертирован — это не сконвертировал игрок Б, а не А. Не путай субъекта действия
-- ВАЖНО: не используй выражение "взял чёрными/белыми" — оно читается как "победил". Пиши: "играл чёрными", "вёл белые фигуры", "игравший чёрными"
-- Если несколько партий тура начались одним и тем же дебютом — обыграй это: "Второй Каталон тура...", "Ещё одна Защита Нимцовича..." и т.п.
-- В конце — 1–2 фразы о турнирной интриге с ТОЧНЫМИ очками из таблицы выше
-- Шахматные термины на русском
-- Без заголовков (#), без маркированных списков, без markdown
-- В самом конце новой строкой: #турнир_претендентов
-- Не упоминай что ты ИИ"""
+    system, user = build_prompt("round_summary",
+        round_name=round_name,
+        results_for_claude=results_for_claude,
+        standings_text=standings_text,
+        is_women=False,
+    )
 
     r = client.messages.create(
         model="claude-sonnet-4-6", max_tokens=700,
-        messages=[{"role": "user", "content": prompt}]
+        system=system,
+        messages=[{"role": "user", "content": user}]
     )
     analysis = _trim_to_sentence(r.content[0].text)
     # Убрать случайные markdown-заголовки если Claude всё же добавил
@@ -1436,29 +1425,15 @@ async def get_round_preview(pairs: list[tuple[str, str]]) -> str:
 
     pairs_text = "\n".join(pairs_lines)
 
-    prompt = f"""Ты — шахматный аналитик, пишешь превью тура Кандидатов 2026 для Telegram-канала.
-
-Пары тура (с реальными результатами этого турнира):
-{pairs_text}
-
-Для КАЖДОЙ пары напиши РОВНО 2 предложения:
-1) Счёт в этом турнире + факт о дебютной специализации или стиле одного из игроков
-2) Чего ожидать от этой конкретной партии
-
-Формат — через пустую строку между парами:
-*Белый – Чёрный*: X:Y в этом турнире. [Факт].
-[Прогноз].
-
-ЖЁСТКИЕ ПРАВИЛА:
-- Строго 2 предложения на пару, не больше
-- Счёт бери из данных выше как есть
-- Называй игроков по фамилии
-- Никаких заголовков, никакого markdown кроме *имён*
-- Каждая пара ОБЯЗАТЕЛЬНА — пропускать нельзя, ровно {len(pairs)} пар"""
+    system, user = build_prompt("round_preview",
+        pairs_text=pairs_text,
+        num_pairs=len(pairs),
+    )
 
     r = client.messages.create(
         model="claude-sonnet-4-6", max_tokens=800,
-        messages=[{"role": "user", "content": prompt}]
+        system=system,
+        messages=[{"role": "user", "content": user}]
     )
     return _trim_to_sentence(r.content[0].text)
 
@@ -1563,28 +1538,20 @@ async def send_pulse_update(bot: Bot, game_data: dict, pgn: str, label: str,
     else:
         time_note = "По времени примерно равны"
 
-    piece_list = fen_to_piece_list(fen, white, black)
-    pawn_info = analyze_pawn_structure(fen) if fen else ""
-    pawn_block = f"\nПешечная структура (точные данные):\n{pawn_info}\n" if pawn_info else ""
-    prompt = f"""Ты — шахматный комментатор, пишешь короткий апдейт для Telegram-канала о турнире претендентов 2026.
-
-Партия: {white} (белые) – {black} (чёрные), идёт {label}
-Ход: {eval_data['move_count']} | Оценка: {eval_data['eval_str']}
-Часы: {white} — {wr}, {black} — {br}
-{time_note}
-Последние ходы: {moves}
-Фигуры на доске (точные данные):
-{piece_list}
-{pawn_block}
-Описывай позицию ТОЛЬКО по списку фигур выше — не придумывай расположения.
-Используй ТОЛЬКО данные о пешечной структуре из раздела выше (проходные, изолированные, сдвоенные, открытые линии) — не определяй их самостоятельно.
-Не называй фигуру «пассивной» или «застрявшей» если она стоит на открытой или полуоткрытой линии — ладья или ферзь на открытой вертикали активны.
-Ровно 2 предложения: что сейчас происходит на доске и кто выглядит лучше.
-Без воды, только факт + оценка. Без заголовков и markdown."""
+    system, user = build_prompt("pulse",
+        white=white, black=black, label=label,
+        move_count=eval_data['move_count'],
+        eval_str=eval_data['eval_str'],
+        moves_san=eval_data.get('moves_san', []),
+        fen=fen,
+        clock_white=wr, clock_black=br,
+        time_note=time_note,
+    )
 
     r = client.messages.create(
         model="claude-sonnet-4-6", max_tokens=150,
-        messages=[{"role": "user", "content": prompt}]
+        system=system,
+        messages=[{"role": "user", "content": user}]
     )
     commentary = _trim_to_sentence(r.content[0].text)
 
@@ -2185,32 +2152,17 @@ async def send_women_round_summary(bot: Bot, round_name: str, games_pgn: list[st
         standings_text = "(таблица недоступна)"
 
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    prompt = f"""Ты пишешь итоги {round_name} женского турнира претендентов 2026 для русскоязычного шахматного Telegram-канала.
-
-Результаты:
-{chr(10).join(results_for_claude)}
-
-Таблица после этого тура: {standings_text}
-
-Стиль — как у chess.com или ChessBase, но на русском:
-- Пиши как спортивный журналист: короткие фактические предложения, живой язык
-- 2–3 предложения на каждую партию: название дебюта, переломный момент (используй данные выше), характер борьбы
-- Переломные моменты описывай через действие игрока, не через цифры оценки движка. НЕ ПИШИ числовые оценки вроде "+0.86" или "-3.03". Вместо этого: "выпустила перевес", "перехватила инициативу", "позиция уравнялась"
-- Конкретный ход можно назвать, но объясняй его смысл по-человечески
-- НЕ описывай фигуры на доске и их расположение — это не нужно для итогов
-- ВАЖНО: следи за логикой "кто ошибся → кто получил перевес → кто не сконвертировал". Не путай субъекта действия
-- ВАЖНО: не используй выражение "взяла чёрными/белыми" — оно читается как "победила". Пиши: "играла чёрными", "вела белые фигуры"
-- Если несколько партий тура начались одним и тем же дебютом — обыграй это
-- Используй женский род глаголов для игроков: "играла", "ошиблась", "нашла", "выиграла"
-- В конце — 1–2 фразы о турнирной интриге с ТОЧНЫМИ очками из таблицы выше
-- Шахматные термины на русском
-- Без заголовков (#), без маркированных списков, без markdown
-- В самом конце новой строкой: #турнир_претенденток
-- Не упоминай что ты ИИ"""
+    system, user = build_prompt("round_summary",
+        round_name=round_name,
+        results_for_claude=results_for_claude,
+        standings_text=standings_text,
+        is_women=True,
+    )
 
     r = client.messages.create(
         model="claude-sonnet-4-6", max_tokens=700,
-        messages=[{"role": "user", "content": prompt}]
+        system=system,
+        messages=[{"role": "user", "content": user}]
     )
     analysis = _trim_to_sentence(r.content[0].text)
     analysis = re.sub(r'^#+\s+', '', analysis, flags=re.MULTILINE)

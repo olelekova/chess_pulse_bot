@@ -20,8 +20,10 @@ git config user.email "olelekova@gmail.com"
 git config user.name "Chess Bot"
 
 # Коммит и пуш
-git add bot.py Dockerfile requirements.txt render.yaml push.sh
-git commit -m "Add clock display + longest think move; fix event logic (game_over, eval_swing cooldown)"
+git add bot.py Dockerfile requirements.txt render.yaml push.sh \
+        commentary_prompts.py tournaments.yaml tournaments_config.py \
+        AGENT_RUNBOOK.md TOURNAMENTS_README.md
+git commit -m "Wire tournaments.yaml into bot.py; add TePe Sigeman 2026 profile"
 git push --force origin main
 
 echo "✅ Готово! Render задеплоит автоматически."

@@ -1,0 +1,366 @@
+# ═══════════════════════════════════════════════════════════════════════
+# tournaments.yaml — конфигурация всех турниров для chess bot
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Как добавить новый турнир:
+#   1. Скопируй блок _template ниже под именем нового турнира.
+#   2. Заполни broadcast_id (с lichess.org/broadcast/...).
+#   3. Поставь start_date / end_date — бот сам активирует профиль в эти даты.
+#   4. Включи нужные алгоритмы (true / false) в секции algorithms.
+#   5. Заполни players (фамилия из PGN → русское имя).
+#   6. Закоммить и задеплой. Никакого Python-кода править не нужно.
+#
+# Поведение:
+#   - Активным считается профиль, у которого active: true И сегодняшняя дата
+#     лежит в [start_date, end_date]. Бот опрашивает все активные профили.
+#   - Можно держать несколько турниров одновременно (мужской + женский + новый).
+#   - Шаблоны (имена, начинающиеся с "_") бот игнорирует.
+#
+# Параметры алгоритмов (числовые пороги) — в секции params каждого профиля.
+# Если не указаны — берутся defaults (см. ниже).
+# ═══════════════════════════════════════════════════════════════════════
+
+
+# ─── Глобальные значения по умолчанию ──────────────────────────────────
+defaults:
+  poll_interval_seconds: 300        # как часто опрашивать Lichess (5 мин)
+  eval_swing_threshold:  1.2        # резкая смена оценки в пешках
+  novelty_move_threshold: 15        # сигнал, если дебют кончился до этого хода
+  opening_status_delay:  900        # задержка перед 15-мин дебютным анализом (сек)
+  pulse_intervals:       [3600, 7200, 10800]  # 1ч, 2ч, 3ч
+  pulse_labels:
+    3600:  "1 час"
+    7200:  "2 часа"
+    10800: "3 часа"
+  tiebreak_rules: ["playoff_first", "sb", "wins", "h2h"]
+  round_start_utc: "12:30"          # 15:30 Кипр / Москва, 13:30 Лиссабон
+
+
+# ─── Описание алгоритмов (для справки и для UI) ────────────────────────
+# Каждый профиль ниже включает/выключает любой из этих ключей.
+algorithm_catalog:
+  preview:
+    title: "Превью тура"
+    when:  "за час до старта тура"
+    why:   "анонс пар, контекст, история встреч"
+  new_game:
+    title: "Старт каждой партии"
+    when:  "при первом обнаружении партии"
+    why:   "отдельный пост с дебютом и ожиданиями"
+  pulse:
+    title: "Пульс-апдейт"
+    when:  "через 1ч / 2ч / 3ч после старта партии"
+    why:   "оценка + что произошло за последний отрезок"
+    params: [pulse_intervals]
+  eval_swing:
+    title: "Резкая смена оценки"
+    when:  "когда |Δeval| ≥ threshold между апдейтами"
+    why:   "ключевые ошибки и тактические удары"
+    params: [eval_swing_threshold]
+  opening_15min:
+    title: "15-мин дебютный анализ"
+    when:  "через 15 минут после старта"
+    why:   "оценка дебютного выбора, новинки"
+    params: [opening_status_delay, novelty_move_threshold]
+  turning_point:
+    title: "Переломный момент партии"
+    when:  "после окончания каждой партии"
+    why:   "разбор ключевого момента с диаграммой"
+  round_summary:
+    title: "Итоги тура + турнирная таблица"
+    when:  "после окончания всех партий тура"
+    why:   "результаты + текущие позиции в таблице"
+  final_standings_with_places:
+    title: "Финальные места (1, 2, 3...)"
+    when:  "только в итогах последнего тура"
+    why:   "победитель + распределение мест с тай-брейками"
+  game_over_post:
+    title: "Пост на окончание партии"
+    when:  "сразу как партия завершилась"
+    why:   "счёт, краткий итог, ссылка на партию"
+  hourly_recap:
+    title: "Часовой обзор по всему туру"
+    when:  "каждый круглый час, пока идёт тур"
+    why:   "сводка по всем партиям одновременно (новый алгоритм, пока выкл.)"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ТУРНИРЫ
+# ═══════════════════════════════════════════════════════════════════════
+
+tournaments:
+
+  # ─── Турнир Претендентов 2026 (мужской, OPEN) ────────────────────────
+  open_candidates_2026:
+    active:        true
+    display_name:  "Турнир претендентов"
+    emoji:         "🏆"
+    qualifies_for: "матч за звание чемпиона мира 2027"
+    start_date:    "2026-03-29"
+    end_date:      "2026-04-15"
+    total_rounds:  14
+    rest_days:     ["2026-04-02", "2026-04-06", "2026-04-10", "2026-04-13"]
+
+    lichess:
+      broadcast_id: "oe4JqS3R"
+      round_ids:
+        - ["uLCZwqAK", "Round 1"]
+        - ["FRTlzP2X", "Round 2"]
+        - ["SDizieNR", "Round 3"]
+        - ["97di6JjX", "Round 4"]
+        - ["liBI9Brw", "Round 5"]
+        - ["WmbQrSNz", "Round 6"]
+        - ["aVbIuZ7Q", "Round 7"]
+        - ["XYRPyV8x", "Round 8"]
+        - ["hTVc2Qgj", "Round 9"]
+        - ["G3oSxPgs", "Round 10"]
+        - ["seMTFSPr", "Round 11"]
+        - ["9SHysZuu", "Round 12"]
+        - ["rFG1W5Tp", "Round 13"]
+        - ["oBkeHnpi", "Round 14"]
+
+    # Облегчённый профиль: только превью, разбор переломов и итог тура
+    algorithms:
+      preview:                     true
+      new_game:                    false
+      pulse:                       false   # без 1ч/2ч/3ч пульсов
+      eval_swing:                  false
+      opening_15min:               false
+      turning_point:               true
+      round_summary:               true
+      game_over_post:              true
+      final_standings_with_places: true
+      hourly_recap:                false
+
+    params:
+      pulse_intervals: []          # выключено целиком
+
+    players:
+      Caruana:        { ru: "Каруана",   chess_com: "fabiano-caruana" }
+      Nakamura:       { ru: "Накамура",  chess_com: "hikaru" }
+      Giri:           { ru: "Гири",      chess_com: "anish-giri" }
+      Praggnanandhaa: { ru: "Прагг",     chess_com: "praggnanandhaa" }
+      Sindarov:       { ru: "Синдаров",  chess_com: "sindarov" }
+      Wei:            { ru: "Вэй И",     chess_com: "wei-yi-cn" }
+      Esipenko:       { ru: "Есипенко",  chess_com: "esipenko" }
+      Bluebaum:       { ru: "Блюбаум",   chess_com: "bluebaum" }
+
+
+  # ─── Женский турнир Претендентов 2026 ────────────────────────────────
+  women_candidates_2026:
+    active:        true
+    display_name:  "Женский турнир претендентов"
+    emoji:         "♛"
+    qualifies_for: "матч за звание чемпионки мира 2027"
+    start_date:    "2026-03-29"
+    end_date:      "2026-04-15"
+    total_rounds:  14
+    rest_days:     ["2026-04-02", "2026-04-06", "2026-04-10", "2026-04-13"]
+
+    lichess:
+      broadcast_id: "xj4qM8Nw"
+      round_ids:
+        - ["diPdGkEA", "Round 1"]
+        - ["EMkf0c6e", "Round 2"]
+        - ["2qEm9CH3", "Round 3"]
+        - ["MDv2BlCp", "Round 4"]
+        - ["VAELuM6E", "Round 5"]
+        - ["hmGcNp3P", "Round 6"]
+        - ["QqBr2Kpr", "Round 7"]
+        - ["R0BP4Jy4", "Round 8"]
+        - ["6Ukl08Ir", "Round 9"]
+        - ["Es2IjSwE", "Round 10"]
+        - ["fDNFUpG9", "Round 11"]
+        - ["u3pemMHq", "Round 12"]
+        - ["o7DgltDn", "Round 13"]
+        - ["dllZX7eJ", "Round 14"]
+      # Если round_ids не покрывают весь турнир, бот пробует
+      # discover_rounds() через broadcast_id.
+      autodiscover_rounds: true
+
+    # Полный профиль: эталон, на котором обкатываются все апдейты
+    algorithms:
+      preview:                     true
+      new_game:                    true
+      pulse:                       true
+      eval_swing:                  true
+      opening_15min:               true
+      turning_point:               true
+      round_summary:               true
+      game_over_post:              true
+      final_standings_with_places: true
+      hourly_recap:                false
+
+    params:
+      pulse_intervals: [3600, 7200]   # только 1ч и 2ч (без 3ч)
+      eval_swing_threshold: 1.2
+
+    players:
+      Zhu:         { ru: "Чжу Цзиньэр" }
+      Tan:         { ru: "Тань Чжунъи" }
+      Goryachkina: { ru: "Горячкина" }
+      Muzychuk:    { ru: "Музычук" }
+      Assaubayeva: { ru: "Ассаубаева" }
+      Lagno:       { ru: "Лагно" }
+      Deshmukh:    { ru: "Дешмук" }
+      Vaishali:    { ru: "Вайшали" }
+      Rameshbabu:  { ru: "Вайшали" }    # альтернативный вариант фамилии в PGN
+
+
+  # ─── TePe Sigeman & Co Chess Tournament 2026 ─────────────────────────
+  # 31-й розыгрыш, Мальмё, Elite Plaza Hotel, 1–7 мая 2026.
+  # 8 игроков, круговой турнир в один круг (round-robin), классика 90+30/40 +30
+  # Туры 1–6 в 15:00 CEST = 13:00 UTC, последний (тур 7) в 12:00 CEST = 10:00 UTC.
+  tepe_sigeman_2026:
+    active:        true
+    display_name:  "TePe Sigeman & Co"
+    emoji:         "🇸🇪"
+    qualifies_for: ""                    # супер-турнир без квалификации
+    start_date:    "2026-05-01"
+    end_date:      "2026-05-07"
+    total_rounds:  7
+    rest_days:     []                    # без выходных, играют каждый день
+
+    lichess:
+      broadcast_id: "1X75mYa7"
+      autodiscover_rounds: true
+      round_ids:
+        - ["ELr1KMpn", "Round 1"]
+        - ["4Uwzk4as", "Round 2"]
+        - ["zSwXjRLX", "Round 3"]
+        - ["qQLhISkG", "Round 4"]
+        - ["mMrsVH3S", "Round 5"]
+        - ["PXk4j6f7", "Round 6"]
+        - ["swuu8ywu", "Round 7"]
+
+    # Light-профиль: супер-турнир, но без женских пульсов.
+    # Карлсен играет редко в классике — переломы и итоги тура важнее, чем
+    # 15-минутный анализ дебюта.
+    algorithms:
+      preview:                     true
+      new_game:                    false
+      pulse:                       false
+      eval_swing:                  true     # включил: топ-рейтинги, ошибки редкие но громкие
+      opening_15min:               false
+      turning_point:               true
+      round_summary:               true
+      game_over_post:              true
+      final_standings_with_places: true
+      hourly_recap:                false
+
+    params:
+      pulse_intervals: []
+      eval_swing_threshold: 1.5    # порог чуть выше — у элиты меньше шуму
+      round_start_utc: "13:00"     # туры 1–6 в 15:00 CEST. Тур 7 идёт в 12:00 CEST,
+                                   # но мы не разруливаем per-round override — превью
+                                   # последнего тура уйдёт на 3ч позже расчётного.
+
+    players:
+      Carlsen:       { ru: "Карлсен",   chess_com: "magnuscarlsen" }
+      Abdusattorov:  { ru: "Абдусатторов", chess_com: "chesswarrior7197" }
+      Erigaisi:      { ru: "Эригайси",  chess_com: "ghandeevam2003" }
+      Foreest:       { ru: "Ван Форест" }
+      "Van Foreest": { ru: "Ван Форест" }   # альтернативное написание в PGN
+      Erdogmus:      { ru: "Эрдогмуш" }
+      Grandelius:    { ru: "Гранделиус", chess_com: "nilsgrandelius" }
+      Woodward:      { ru: "Вудворд" }
+      Zhu:           { ru: "Чжу Цзиньэр" }   # та же из женского Кандидатов
+
+
+  # ─── ШАБЛОН для нового турнира ───────────────────────────────────────
+  # Скопируй этот блок, переименуй (например new_super_tournament_2026)
+  # и заполни поля. Удалять _template не нужно — бот игнорирует имена с "_".
+  _template:
+    active:        false
+    display_name:  "Название турнира"   # как показывать в постах
+    emoji:         "♟️"
+    qualifies_for: ""                    # "выход в Кандидаты-2027" или пусто
+    start_date:    "YYYY-MM-DD"
+    end_date:      "YYYY-MM-DD"
+    total_rounds:  9
+    rest_days:     []                    # ["YYYY-MM-DD", ...] или []
+
+    lichess:
+      broadcast_id: ""                   # из URL lichess.org/broadcast/.../{ID}
+      round_ids:    []                   # [["roundId", "Round 1"], ...]
+      autodiscover_rounds: true          # бот сам подтянет раунды по broadcast
+
+    # ВЫБЕРИ свой профиль апдейтов:
+    #   - "full"     — всё включено (как женский Кандидатов)
+    #   - "light"    — только превью + переломы + итоги (как мужской)
+    #   - "minimal"  — только итоги тура и финальные места
+    # Можно мешать вручную — просто перезапиши флаги ниже.
+    algorithms:
+      preview:                     true
+      new_game:                    false
+      pulse:                       false
+      eval_swing:                  false
+      opening_15min:               false
+      turning_point:               true
+      round_summary:               true
+      game_over_post:              true
+      final_standings_with_places: true
+      hourly_recap:                false
+
+    params:
+      pulse_intervals: []
+      # eval_swing_threshold: 1.2        # переопределить порог
+      # opening_status_delay: 900        # переопределить задержку
+
+    # Фамилия из PGN → русское имя (+ опционально chess.com username для репертуара)
+    players: {}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ПРЕСЕТЫ — для быстрого старта нового турнира
+# ═══════════════════════════════════════════════════════════════════════
+# Используй python tournaments_config.py --apply-preset <preset> <tournament_id>
+# чтобы залить пресет в существующий профиль.
+presets:
+  full:        # женский стиль
+    preview: true
+    new_game: true
+    pulse: true
+    eval_swing: true
+    opening_15min: true
+    turning_point: true
+    round_summary: true
+    game_over_post: true
+    final_standings_with_places: true
+    hourly_recap: false
+
+  light:       # мужской стиль (минимум спама)
+    preview: true
+    new_game: false
+    pulse: false
+    eval_swing: false
+    opening_15min: false
+    turning_point: true
+    round_summary: true
+    game_over_post: true
+    final_standings_with_places: true
+    hourly_recap: false
+
+  minimal:    # только итоги
+    preview: false
+    new_game: false
+    pulse: false
+    eval_swing: false
+    opening_15min: false
+    turning_point: false
+    round_summary: true
+    game_over_post: false
+    final_standings_with_places: true
+    hourly_recap: false
+
+  hourly:     # экспериментальный — часовой digest по всему туру
+    preview: true
+    new_game: false
+    pulse: false
+    eval_swing: true
+    opening_15min: false
+    turning_point: true
+    round_summary: true
+    game_over_post: true
+    final_standings_with_places: true
+    hourly_recap: true
