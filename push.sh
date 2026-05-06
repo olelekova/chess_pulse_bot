@@ -23,7 +23,7 @@ git config user.name "Chess Bot"
 git add bot.py Dockerfile requirements.txt render.yaml push.sh \
         commentary_prompts.py tournaments.yaml tournaments_config.py \
         AGENT_RUNBOOK.md TOURNAMENTS_README.md
-git commit -m "Wire tournaments.yaml into bot.py; add TePe Sigeman 2026 profile"
+git commit -m "Fix game_over color confusion + per-player gender in round_summary"
 git push --force origin main
 
 echo "✅ Готово! Render задеплоит автоматически."

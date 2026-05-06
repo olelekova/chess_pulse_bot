@@ -38,6 +38,10 @@ OPENING_STATUS_DELAY  = 900    # 15 минут до дебютного анал�
 PULSE_INTERVALS = [3600, 7200, 10800]
 PULSE_LABELS    = {3600: "1 час", 7200: "2 часа", 10800: "3 часа"}
 
+# Кулдаун между eval_swing постами на одной партии (в полных ходах).
+# Перекрывается из tournaments.yaml params.eval_swing_cooldown_moves.
+EVAL_SWING_COOLDOWN_MOVES = 5
+
 # Lichess Broadcast — FIDE Candidates 2026 (серия целиком)
 LICHESS_BROADCAST_ID = "oe4JqS3R"
 
@@ -225,6 +229,7 @@ def _build_round_schedule(profile: dict) -> dict:
     return schedule
 
 
+_main_profile = None    # активный YAML-профиль для Open-слота (доступен ниже)
 try:
     _YAML_CFG = load_tournaments()
     _today_utc = datetime.datetime.now(_UTC).date()
@@ -256,12 +261,18 @@ try:
             "qualifies_for": _main_profile["qualifies_for"],
             "total_rounds":  _main_profile["total_rounds"],
         })
-        # Пульс-интервалы (если профиль их даёт)
-        if _main_profile["params"].get("pulse_intervals"):
+        # Пульс-интервалы — перекрываем даже пустым списком,
+        # чтобы профиль с pulse_intervals: [] реально отключал пульсы
+        # (старая проверка `if list:` пропускала пустой список и оставляла
+        # хардкод [3600,7200,10800] — пульсы шли несмотря на профиль).
+        if "pulse_intervals" in _main_profile["params"]:
             PULSE_INTERVALS = list(_main_profile["params"]["pulse_intervals"])
         # Порог eval_swing
         if "eval_swing_threshold" in _main_profile["params"]:
             EVAL_SWING_THRESHOLD = float(_main_profile["params"]["eval_swing_threshold"])
+        # Кулдаун между eval_swing постами (в ходах) — снижает шум
+        if "eval_swing_cooldown_moves" in _main_profile["params"]:
+            EVAL_SWING_COOLDOWN_MOVES = int(_main_profile["params"]["eval_swing_cooldown_moves"])
         print(f"[YAML] broadcast={LICHESS_BROADCAST_ID}, "
               f"rounds={len(KNOWN_ROUND_IDS)}, "
               f"algos_on={sum(_main_profile['algorithms'].values())}/10")
@@ -563,7 +574,8 @@ def analyze_clocks(pgn_text: str) -> dict:
         for i, clk in enumerate(white_clocks):
             if clk is not None and prev_w is not None:
                 spent = prev_w + increment - clk
-                if spent > longest_secs:
+                # Пропускаем первый ход — часы часто включают время на рассадку/подготовку
+                if i > 0 and spent > longest_secs and spent > 0:
                     longest_secs = spent
                     san = move_sans[i * 2] if i * 2 < len(move_sans) else "?"
                     longest = {"move_num": i + 1, "san": san,
@@ -575,7 +587,8 @@ def analyze_clocks(pgn_text: str) -> dict:
         for i, clk in enumerate(black_clocks):
             if clk is not None and prev_b is not None:
                 spent = prev_b + increment - clk
-                if spent > longest_secs:
+                # Пропускаем первый ход — часы часто включают время на рассадку/подготовку
+                if i > 0 and spent > longest_secs and spent > 0:
                     longest_secs = spent
                     san = move_sans[i * 2 + 1] if i * 2 + 1 < len(move_sans) else "?"
                     longest = {"move_num": i + 1, "san": san,
@@ -714,7 +727,13 @@ def find_turning_points(pgn_text: str) -> list[dict]:
                     info = engine.analyse(b, chess.engine.Limit(depth=10))
                     sc = info["score"].white()
                     if sc.is_mate():
-                        ev = 99.0 if sc.mate() > 0 else -99.0
+                        mate_in = sc.mate()
+                        # Далёкий мат = большое преимущество, не 99.0
+                        # (иначе свинги между "мат в 15" и "+3" выглядят огромными)
+                        if abs(mate_in) <= 5:
+                            ev = 99.0 if mate_in > 0 else -99.0
+                        else:
+                            ev = 10.0 if mate_in > 0 else -10.0
                     else:
                         ev = sc.score() / 100.0
                     evals.append(ev)
@@ -963,8 +982,15 @@ def evaluate_position(pgn_text: str) -> dict | None:
 
         score = info["score"].white()
         if score.is_mate():
-            eval_num = 99.0 if score.mate() > 0 else -99.0
-            eval_str = f"Мат в {score.mate()}"
+            mate_in = score.mate()
+            abs_mate = abs(mate_in)
+            if abs_mate <= 5:
+                eval_num = 99.0 if mate_in > 0 else -99.0
+                eval_str = f"Мат в {mate_in}"
+            else:
+                # Далёкий мат — показываем как большое преимущество, не "мат в X"
+                eval_num = 10.0 if mate_in > 0 else -10.0
+                eval_str = "решающий перевес" if mate_in > 0 else "решающий перевес чёрных"
         else:
             eval_num = score.score() / 100.0
             eval_str = f"{eval_num:+.2f}"
@@ -1066,6 +1092,8 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
             missed_note=missed_note,
             history_note=history_note,
             opening_info=opening_info,
+            result_str=result_str,   # game_over: явно указать кто выиграл,
+                                     # иначе Claude гадает по позиции и путает
         )
         max_tokens = 350
 
@@ -1248,10 +1276,19 @@ def get_game_result(pgn_text: str) -> str:
 
 async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
     """Отправить единый итоговый разбор тура после завершения всех партий.
-    Включает результаты, переломные моменты и таблицу — всё одним текстовым сообщением."""
+    Включает результаты, переломные моменты и таблицу — всё одним текстовым сообщением.
+
+    После итогов и таблицы — отдельный пост 🔍 *Разбор* с диаграммой
+    для самой драматичной партии тура (если turning_point: true в YAML).
+    """
     results_lines = []
     results_for_claude = []
     loop = asyncio.get_event_loop()
+
+    # Кандидат «лучшая партия тура» — с максимальным swing-ом (по чувствительности
+    # переломных моментов). Используется ниже для send_game_analysis.
+    best_swing = 0.0
+    best_pgn: str | None = None
 
     for pgn in games_pgn:
         gd = pgn_to_game_data(pgn)
@@ -1272,6 +1309,15 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
 
         # Переломные моменты — описываем по-человечески
         tps = await loop.run_in_executor(None, find_turning_points, pgn)
+
+        # Кандидат на «лучшую партию тура»: максимальный swing среди всех
+        # переломных моментов любой партии. Кешированный find_turning_points
+        # значит, что Stockfish уже отработал — выбор бесплатный.
+        for tp in tps:
+            if tp.get("swing", 0.0) > best_swing:
+                best_swing = tp["swing"]
+                best_pgn = pgn
+
         tp_descs = []
         for tp in tps:
             ev_before = float(tp['eval_before'])
@@ -1331,11 +1377,25 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
 
     # Claude-разбор с голосом Полгар+Сейраван
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    # Достаём из активного YAML-профиля: список женщин в составе
+    # (для смешанных турниров вроде Sigeman, где играет одна Чжу),
+    # отображаемое имя и хэштег.
+    _female = []
+    _display = "турнира претендентов 2026"
+    _hashtag = "#турнир_претендентов"
+    if _main_profile:
+        _female = [info["ru"] for info in _main_profile["players"].values()
+                   if info.get("gender") == "f"]
+        _display = _main_profile["display_name"] or _display
+        _hashtag = _main_profile["hashtag"] or _hashtag
     system, user = build_prompt("round_summary",
         round_name=round_name,
         results_for_claude=results_for_claude,
         standings_text=standings_text,
         is_women=False,
+        female_players=_female,
+        tournament_display=_display,
+        hashtag=_hashtag,
     )
 
     r = client.messages.create(
@@ -1363,66 +1423,33 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
     if not sent_final:
         await send_standings(bot, TELEGRAM_CHAT_ID)
 
-
-async def get_tournament_h2h() -> dict[tuple[str, str], dict]:
-    """Собрать реальные результаты H2H из уже сыгранных раундов этого турнира.
-    Ключ — каноническая пара (sorted), значение — очки каждого + число партий.
-    Возвращает {(playerA, playerB): {"pts": {playerA: float, playerB: float}, "games": int}}.
-    """
-    h2h: dict[tuple[str, str], dict] = {}
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        for rid, _ in KNOWN_ROUND_IDS:
-            try:
-                r = await client.get(
-                    f"https://lichess.org/api/broadcast/round/{rid}.pgn",
-                    headers={"User-Agent": "CandidatesBot/1.0"}
-                )
-                if r.status_code != 200 or not r.text.strip():
-                    continue
-                for pgn in split_pgn(r.text):
-                    if not is_game_finished(pgn):
-                        continue
-                    gd = pgn_to_game_data(pgn)
-                    w, b = gd["white"]["username"], gd["black"]["username"]
-                    res = gd.get("result", "*")
-                    # Каноническая пара — сортированная, чтобы (Гири, Есипенко) и
-                    # (Есипенко, Гири) попадали в одну запись
-                    key = tuple(sorted([w, b]))
-                    if key not in h2h:
-                        h2h[key] = {"pts": {key[0]: 0.0, key[1]: 0.0}, "games": 0}
-                    h2h[key]["games"] += 1
-                    if res == "1-0":
-                        h2h[key]["pts"][w] += 1.0
-                    elif res == "0-1":
-                        h2h[key]["pts"][b] += 1.0
-                    elif res == "1/2-1/2":
-                        h2h[key]["pts"][w] += 0.5
-                        h2h[key]["pts"][b] += 0.5
-            except Exception:
-                pass
-    return h2h
+    # 🔍 Разбор лучшей партии тура — отдельным постом с диаграммой.
+    # Один пост на тур, не на каждую партию (избегаем спама).
+    # Минимальный порог swing 1.5 — иначе все партии «спокойные» и разбор
+    # будет натянутым; в таком случае пропускаем разбор вовсе.
+    if (TOURNAMENT_PROFILES["open"].get("turning_point", True)
+            and best_pgn is not None
+            and best_swing >= 1.5):
+        await asyncio.sleep(2)
+        try:
+            best_data = pgn_to_game_data(best_pgn)
+            await send_game_analysis(bot, best_data, best_pgn)
+        except Exception as e:
+            print(f"send_game_analysis (best of round) error: {e}")
 
 
 async def get_round_preview(pairs: list[tuple[str, str]]) -> str:
-    """Claude генерирует превью тура с реальными H2H из этого турнира + исторический контекст."""
+    """Claude генерирует превью тура: стиль игроков и чего ожидать.
+
+    Без блока «История встреч»: турниры не всегда круговые, и счёт «в этом
+    турнире» либо отсутствует (первая встреча пары), либо тривиален
+    (одна партия → 1:0 / 0:1 / ½:½). Историю классических встреч из
+    внешних баз тянуть ненадёжно (скрейп, рейт-лимиты, риск 403 в момент
+    отправки превью), поэтому в превью держимся стиля и интриги.
+    """
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    # Загружаем реальные результаты этого турнира
-    tournament_h2h = await get_tournament_h2h()
-
-    # Строим блок с данными для каждой пары
-    pairs_lines = []
-    for w, b in pairs:
-        key = tuple(sorted([w, b]))
-        if key in tournament_h2h:
-            d = tournament_h2h[key]
-            w_pts = d["pts"].get(w, 0.0)
-            b_pts = d["pts"].get(b, 0.0)
-            score_line = f"в этом турнире: {w_pts}:{b_pts} ({d['games']} партий)"
-        else:
-            score_line = "в этом турнире ещё не встречались"
-        pairs_lines.append(f"• {w} (белые) – {b} (чёрные) | {score_line}")
-
+    pairs_lines = [f"• {w} (белые) – {b} (чёрные)" for w, b in pairs]
     pairs_text = "\n".join(pairs_lines)
 
     system, user = build_prompt("round_preview",
@@ -1454,20 +1481,52 @@ async def send_round_start(bot: Bot, round_name: str, games_pgn: list[str]):
         moscow = (start_utc + datetime.timedelta(hours=3)).strftime("%H:%M")
         time_line = f"\n🕐 *{lisbon} Лиссабон / {moscow} Москва*\n"
 
-    # H2H прогноз от Claude
+    # Превью + стэндинги тянем параллельно (оба сетевые)
+    preview = ""
+    points: dict[str, float] = {}
+    rounds_played = 0
     try:
-        preview = await get_round_preview(pairs)
+        preview, (points, rounds_played) = await asyncio.gather(
+            get_round_preview(pairs),
+            calculate_standings(),
+        )
     except Exception as e:
-        print(f"Preview error: {e}")
-        preview = ""
+        print(f"send_round_start data error: {e}")
 
     pairs_lines = "\n".join([f"• *{w}* — *{b}*" for w, b in pairs])
 
-    msg = (f"🏆 *Турнир Претендентов — {round_name}*\n"
+    # Турнирный контекст перед туром — однострочный список «Имя N» через запятую.
+    # Пропускаем на 1-м туре (rounds_played == 0): таблица из нулей бесполезна.
+    standings_block = ""
+    if rounds_played > 0 and points:
+        items = []
+        for name, pts in sorted(
+            ((n, p) for n, p in points.items() if n in OPEN_PLAYERS_RU),
+            key=lambda x: (-x[1], x[0]),
+        ):
+            pts_s = str(int(pts)) if pts == int(pts) else str(pts)
+            items.append(f"{name} {pts_s}")
+        if items:
+            standings_block = (
+                f"📊 *Положение перед {round_name}:* "
+                f"{', '.join(items)}\n\n"
+            )
+
+    preview_block = f"🔮 *Чего ждать в туре:*\n{preview}\n\n" if preview else ""
+
+    # Заголовок берём из активного профиля (TOURNAMENT_PROFILES["open"] подменяется
+    # из tournaments.yaml на старте, см. блок YAML OVERRIDE выше). Так Sigeman будет
+    # «🇸🇪 *TePe Sigeman & Co 2026 — Round 5*», а не «🏆 *Турнир Претендентов — ...*».
+    _open_profile = TOURNAMENT_PROFILES.get("open", {})
+    title_emoji = _open_profile.get("emoji", "🏆")
+    title_name  = _open_profile.get("display_name", "Турнир претендентов")
+
+    msg = (f"{title_emoji} *{title_name} — {round_name}*\n"
            f"_{today}_"
            f"{time_line}\n"
+           f"{standings_block}"
            f"Пары тура:\n{pairs_lines}\n\n"
-           f"📊 *История встреч в классике:*\n{preview}\n\n"
+           f"{preview_block}"
            f"Слежу за всеми партиями 📡")
     await send_update(bot, msg)
 
@@ -1903,8 +1962,17 @@ async def send_standings(bot: Bot, chat_id: str | int):
         pts_str = str(int(pts)) if pts == int(pts) else str(pts)
         lines.append(f"{medal} *{name}* — {pts_str}")
 
-    rounds_str = f"после {rounds_played} туров" if rounds_played else "турнир ещё не начался"
-    msg = f"📊 *Таблица Кандидатов 2026* ({rounds_str})\n\n" + "\n".join(lines)
+    # «после 1 туров» режет глаз; используем ordinal, чтобы не возиться с
+    # склонением «тур / тура / туров»
+    rounds_str = f"после {rounds_played}-го тура" if rounds_played else "турнир ещё не начался"
+
+    # Заголовок берём из активного профиля (см. блок YAML OVERRIDE).
+    # Раньше тут был хардкод «Таблица Кандидатов 2026», который оставался
+    # и для Sigeman, и для любого другого нового турнира.
+    _open_profile = TOURNAMENT_PROFILES.get("open", {})
+    emoji = _open_profile.get("emoji", "📊")
+    name  = _open_profile.get("display_name", "Турнир претендентов")
+    msg = f"{emoji} *Таблица — {name}* ({rounds_str})\n\n" + "\n".join(lines)
     await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
 
@@ -2279,7 +2347,7 @@ async def women_monitoring_step(bot: Bot, now: float):
                     swing = eval_data["eval_num"] - baseline["eval_num"]
                     if abs(swing) >= EVAL_SWING_THRESHOLD:
                         last_swing = w_games_swing_move.get(game_id, 0)
-                        if eval_data["move_count"] - last_swing >= 5:
+                        if eval_data["move_count"] - last_swing >= EVAL_SWING_COOLDOWN_MOVES:
                             w_games_swing_move[game_id] = eval_data["move_count"]
                             base_ev = baseline["eval_num"]
                             curr_ev = eval_data["eval_num"]
@@ -2443,7 +2511,7 @@ async def monitoring_loop(bot: Bot):
                         swing = eval_data["eval_num"] - baseline["eval_num"]
                         if abs(swing) >= EVAL_SWING_THRESHOLD:
                             last_swing = games_swing_move.get(game_id, 0)
-                            if eval_data["move_count"] - last_swing >= 5:
+                            if eval_data["move_count"] - last_swing >= EVAL_SWING_COOLDOWN_MOVES:
                                 games_swing_move[game_id] = eval_data["move_count"]
                                 # Определяем: упущенное преимущество или нет
                                 base_ev = baseline["eval_num"]
@@ -2455,15 +2523,23 @@ async def monitoring_loop(bot: Bot):
                                 else:
                                     event_type = "eval_swing"
 
-                # Проверяем профиль — мужской турнир может не отправлять некоторые события
+                # Проверяем профиль — мужской турнир может не отправлять некоторые события.
+                # Внимание: games_over_sent уже добавлен выше, так что выключение
+                # game_over_post НЕ ломает детект «все партии тура завершены»
+                # (round_summary триггерится по pgn_is_finished, а не по этой ветке).
                 open_prof = TOURNAMENT_PROFILES["open"]
                 send_event = False
                 if event_type == "game_over":
-                    send_event = True  # game_over всегда отправляем
+                    send_event = open_prof.get("game_over_post", True)
                 elif event_type == "new_game":
                     send_event = open_prof.get("new_game", True)
                 elif event_type in ("eval_swing", "eval_swing_missed"):
-                    send_event = open_prof.get("eval_swing", True)
+                    # Поздняя стадия партии (>60 ходов) — eval_swing уже излишен,
+                    # game_over/round_summary всё равно подведут итог. Срезаем шум.
+                    if eval_data["move_count"] > 60:
+                        send_event = False
+                    else:
+                        send_event = open_prof.get("eval_swing", True)
 
                 if event_type and send_event:
                     clock_info = analyze_clocks(pgn)
@@ -2493,7 +2569,12 @@ async def monitoring_loop(bot: Bot):
                     await send_15min_status(bot, game_data, pgn)
 
                 # ── Пульс-апдейты через 60/120/180 мин ─────────
-                if not finished:
+                # Гейтим на алгоритм-флаге профиля (раньше не гейтилось — пульсы
+                # шли даже при pulse: false в YAML). И PULSE_INTERVALS должен
+                # быть непустым — пресет с pulse_intervals: [] = выключено.
+                if (not finished
+                        and open_prof.get("pulse", True)
+                        and PULSE_INTERVALS):
                     sent_pulses = games_pulse_sent.setdefault(game_id, set())
                     for interval in PULSE_INTERVALS:
                         if elapsed >= interval and interval not in sent_pulses:

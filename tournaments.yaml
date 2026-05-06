@@ -196,15 +196,15 @@ tournaments:
       eval_swing_threshold: 1.2
 
     players:
-      Zhu:         { ru: "Чжу Цзиньэр" }
-      Tan:         { ru: "Тань Чжунъи" }
-      Goryachkina: { ru: "Горячкина" }
-      Muzychuk:    { ru: "Музычук" }
-      Assaubayeva: { ru: "Ассаубаева" }
-      Lagno:       { ru: "Лагно" }
-      Deshmukh:    { ru: "Дешмук" }
-      Vaishali:    { ru: "Вайшали" }
-      Rameshbabu:  { ru: "Вайшали" }    # альтернативный вариант фамилии в PGN
+      Zhu:         { ru: "Чжу Цзиньэр", gender: f }
+      Tan:         { ru: "Тань Чжунъи", gender: f }
+      Goryachkina: { ru: "Горячкина", gender: f }
+      Muzychuk:    { ru: "Музычук", gender: f }
+      Assaubayeva: { ru: "Ассаубаева", gender: f }
+      Lagno:       { ru: "Лагно", gender: f }
+      Deshmukh:    { ru: "Дешмук", gender: f }
+      Vaishali:    { ru: "Вайшали", gender: f }
+      Rameshbabu:  { ru: "Вайшали", gender: f }    # альтернативный вариант фамилии в PGN
 
 
   # ─── TePe Sigeman & Co Chess Tournament 2026 ─────────────────────────
@@ -213,7 +213,9 @@ tournaments:
   # Туры 1–6 в 15:00 CEST = 13:00 UTC, последний (тур 7) в 12:00 CEST = 10:00 UTC.
   tepe_sigeman_2026:
     active:        true
-    display_name:  "TePe Sigeman & Co"
+    display_name:  "TePe Sigeman & Co 2026"
+    short_name:    "Sigeman"
+    hashtag:       "#tepe_sigeman"
     emoji:         "🇸🇪"
     qualifies_for: ""                    # супер-турнир без квалификации
     start_date:    "2026-05-01"
@@ -233,28 +235,37 @@ tournaments:
         - ["PXk4j6f7", "Round 6"]
         - ["swuu8ywu", "Round 7"]
 
-    # Light-профиль: супер-турнир, но без женских пульсов.
-    # Карлсен играет редко в классике — переломы и итоги тура важнее, чем
-    # 15-минутный анализ дебюта.
+    # Lazy-scroll профиль: лента читабельна с одного пролистывания.
+    # Цель: ~5–6 постов на тур.
+    #   1. preview перед туром
+    #   2. 0–2 eval_swing на громких swing-ах (threshold=2.0, cooldown=10 ходов)
+    #   3. round_summary с результатами всех партий + анализом дня
+    #   4. таблица очков (auto после round_summary)
+    #   5. 🔍 Разбор лучшей партии тура с диаграммой (один на тур)
+    # Индивидуальные game_over посты выключены — результаты идут одним блоком
+    # внутри round_summary.
     algorithms:
       preview:                     true
       new_game:                    false
       pulse:                       false
-      eval_swing:                  true     # включил: топ-рейтинги, ошибки редкие но громкие
+      eval_swing:                  true     # только на серьёзных свингах
       opening_15min:               false
-      turning_point:               true
+      turning_point:               true     # = разбор ОДНОЙ лучшей партии тура
       round_summary:               true
-      game_over_post:              true
+      game_over_post:              false    # → батчем в round_summary
       final_standings_with_places: true
       hourly_recap:                false
 
     params:
       pulse_intervals: []
-      eval_swing_threshold: 1.5    # порог чуть выше — у элиты меньше шуму
-      round_start_utc: "13:00"     # туры 1–6 в 15:00 CEST. Тур 7 идёт в 12:00 CEST,
-                                   # но мы не разруливаем per-round override — превью
-                                   # последнего тура уйдёт на 3ч позже расчётного.
+      eval_swing_threshold: 2.0       # выше старого 1.5 — режем шум переколебаний
+      eval_swing_cooldown_moves: 10   # выше старого 5 — больше тишины между постами
+      round_start_utc: "13:00"        # туры 1–6 в 15:00 CEST. Тур 7 идёт в 12:00 CEST,
+                                      # но мы не разруливаем per-round override — превью
+                                      # последнего тура уйдёт на 3ч позже расчётного.
 
+    # gender: m (по умолчанию) или f — нужно для правильного рода глаголов
+    # в комментариях смешанных турниров. Если не указано — m.
     players:
       Carlsen:       { ru: "Карлсен",   chess_com: "magnuscarlsen" }
       Abdusattorov:  { ru: "Абдусатторов", chess_com: "chesswarrior7197" }
@@ -264,7 +275,7 @@ tournaments:
       Erdogmus:      { ru: "Эрдогмуш" }
       Grandelius:    { ru: "Гранделиус", chess_com: "nilsgrandelius" }
       Woodward:      { ru: "Вудворд" }
-      Zhu:           { ru: "Чжу Цзиньэр" }   # та же из женского Кандидатов
+      Zhu:           { ru: "Чжу Цзиньэр", gender: f }   # единственная женщина в составе
 
 
   # ─── ШАБЛОН для нового турнира ───────────────────────────────────────

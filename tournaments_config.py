@@ -158,15 +158,22 @@ def _normalize_profile(tid: str, raw: dict, defaults: dict) -> dict:
         round_ids.append((str(item[0]), str(item[1])))
     autodiscover = bool(lichess.get("autodiscover_rounds", True))
 
-    # Игроки
+    # Игроки. gender: 'm' (default) или 'f' — нужно для правильного рода
+    # глаголов в комментариях смешанных по полу турниров.
     players = {}
     for surname, info in (raw.get("players") or {}).items():
         if isinstance(info, str):
-            players[surname] = {"ru": info, "chess_com": ""}
+            players[surname] = {"ru": info, "chess_com": "", "gender": "m"}
         elif isinstance(info, dict):
+            g = str(info.get("gender", "m")).lower()
+            if g not in ("m", "f"):
+                raise ValueError(
+                    f"[{tid}] players[{surname}].gender = {g!r}, ожидалось 'm' или 'f'"
+                )
             players[surname] = {
-                "ru": info.get("ru", surname),
+                "ru":        info.get("ru", surname),
                 "chess_com": info.get("chess_com", ""),
+                "gender":    g,
             }
         else:
             raise ValueError(f"[{tid}] players[{surname}] неверного типа: {type(info)}")
@@ -175,6 +182,8 @@ def _normalize_profile(tid: str, raw: dict, defaults: dict) -> dict:
         "id": tid,
         "active":               bool(raw.get("active", True)),
         "display_name":         raw["display_name"],
+        "short_name":           raw.get("short_name", raw["display_name"]),
+        "hashtag":              raw.get("hashtag", ""),
         "emoji":                raw.get("emoji", "♟️"),
         "qualifies_for":        raw.get("qualifies_for", ""),
         "start_date":           start,
