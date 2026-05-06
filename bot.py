@@ -662,7 +662,13 @@ def get_board_png_at_move(pgn_text: str, move_index: int) -> bytes | None:
 
 def _build_tp_dict(causing_idx: int, evals: list, san_list: list,
                    moves: list, game) -> dict:
-    """Собрать dict переломного момента по индексу хода."""
+    """Собрать dict переломного момента по индексу хода.
+
+    followup_san: 5 полуходов ПОСЛЕ переломного — нужны Claude'у, чтобы
+    описать «как соперник этим воспользовался» вместо общих слов про
+    «решающую перестройку на другом участке доски». Без этого комментарий
+    обрывается на самом интересном месте.
+    """
     eval_idx = causing_idx + 1  # evals[causing_idx+1] = оценка ПОСЛЕ этого хода
     move_num = causing_idx // 2 + 1
     color = "белых" if causing_idx % 2 == 0 else "чёрных"
@@ -674,6 +680,16 @@ def _build_tp_dict(causing_idx: int, evals: list, san_list: list,
     for j in range(causing_idx + 1):
         board_at_tp.push(moves[j])
 
+    # Следующие 5 полуходов с их оценками — даём Claude конкретику,
+    # чтобы он мог рассказать, что было после ошибки/находки.
+    followup_san = []
+    followup_evals = []
+    for k in range(causing_idx + 1, min(causing_idx + 6, len(san_list))):
+        followup_san.append(san_list[k])
+        ev_after_k = evals[k + 1] if k + 1 < len(evals) else None
+        if ev_after_k is not None:
+            followup_evals.append(ev_after_k)
+
     return {
         "move_index": causing_idx + 1,
         "move_num": move_num,
@@ -683,6 +699,8 @@ def _build_tp_dict(causing_idx: int, evals: list, san_list: list,
         "eval_after": f"{eval_after:+.2f}",
         "swing": abs(eval_after - eval_before),
         "fen": board_at_tp.fen(),
+        "followup_san": followup_san,
+        "followup_evals": followup_evals,
     }
 
 
@@ -1168,15 +1186,42 @@ async def get_turning_point_commentary(game_data: dict, tp: dict, result: str) -
     else:
         what_happened = f"ход {move_san} стал поворотным моментом"
 
+    # Конкретное продолжение партии (ходы соперника после переломного).
+    # Формат: «28.Bxh6 (+1.4) Kg7 (+1.5) 29.Qd2 (+1.7) …». Так Claude
+    # видит и сами ходы, и динамику оценки — и описание не сваливается
+    # в общие слова про «решающую перестройку».
+    followup_line = ""
+    f_san = tp.get("followup_san", [])
+    f_evals = tp.get("followup_evals", [])
+    if f_san:
+        # Полуход за ходом, добавляя номер хода и оценку, если есть.
+        # causing_idx тут восстанавливаем из move_index/color: первый ply
+        # в followup всегда сделан противоположным цветом.
+        first_idx = tp["move_index"]  # первый ply followup
+        parts = []
+        for i, san in enumerate(f_san):
+            ply = first_idx + i
+            mv_n = ply // 2 + 1
+            sep = "." if ply % 2 == 0 else "..."
+            ev_str = ""
+            if i < len(f_evals):
+                ev_str = f" ({f_evals[i]:+.2f})"
+            parts.append(f"{mv_n}{sep}{san}{ev_str}")
+        followup_line = " ".join(parts)
+
     system, user = build_prompt("turning_point",
         white=white, black=black,
         result_ru=result_ru,
         what_happened=what_happened,
         fen=tp.get("fen", ""),
+        followup_line=followup_line,
     )
 
     r = client.messages.create(
-        model="claude-sonnet-4-6", max_tokens=300,
+        # 450 вместо 300 — теперь промпт просит 3 конкретных предложения
+        # с разбором followup-ходов, а не 2 общих. На 300 тексты обрезались
+        # ровно перед «как именно белые конвертировали».
+        model="claude-sonnet-4-6", max_tokens=450,
         system=system,
         messages=[{"role": "user", "content": user}]
     )
