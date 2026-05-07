@@ -82,6 +82,12 @@ algorithm_catalog:
     title: "Часовой обзор по всему туру"
     when:  "каждый круглый час, пока идёт тур"
     why:   "сводка по всем партиям одновременно (новый алгоритм, пока выкл.)"
+  daily_digest:
+    title: "Дневная сводка"
+    when:  "после окончания всех партий игрового дня"
+    why:   "один пост в день со всеми результатами + таблицей. Под формат
+            rapid+blitz GCT, где «тур» — слишком мелкая единица (9-18 партий
+            в день). Пока новый алгоритм, в Фазе 1 только описан в каталоге."
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -276,6 +282,278 @@ tournaments:
       Grandelius:    { ru: "Гранделиус", chess_com: "nilsgrandelius" }
       Woodward:      { ru: "Вудворд" }
       Zhu:           { ru: "Чжу Цзиньэр", gender: f }   # единственная женщина в составе
+
+
+  # ═════════════════════════════════════════════════════════════════════
+  # GRAND CHESS TOUR 2026 — все 6 этапов
+  # ═════════════════════════════════════════════════════════════════════
+  # Сюжет: Гукеш и Синдаров играют здесь, а в этом году будут и в матче
+  # за звание чемпиона мира. Поэтому канал хочет видеть результаты по всем
+  # этапам, но не заваливаться постами — отсюда coverage_tier: secondary
+  # и алгоритм daily_digest (один пост за игровой день, не на каждый тур).
+  #
+  # Pipeline для secondary-турниров пока НЕ реализован в bot.py (см. план
+  # Фазы 2). До тех пор все профили GCT держим active: false — это
+  # документация и заготовка под будущую активацию.
+  # ═════════════════════════════════════════════════════════════════════
+
+  # ─── GCT этап 1: Super Rapid & Blitz Poland 2026 (Варшава) ──────────
+  # 3–10 мая 2026. Делится на Rapid (1 круг по 9 туров) и Blitz (2 круга
+  # по 9 туров = 18). Lichess делает на каждую секцию отдельный broadcast.
+  gct_poland_2026_rapid:
+    active:         false             # Фаза 2: включить, когда есть код
+    coverage_tier:  secondary
+    display_name:   "GCT Super Rapid Poland 2026"
+    short_name:     "GCT Poland Rapid"
+    hashtag:        "#gct_poland"
+    emoji:          "🇵🇱"
+    qualifies_for:  ""
+    start_date:     "2026-05-03"
+    end_date:       "2026-05-07"     # rapid-секция, 9 туров
+    total_rounds:   9
+    rest_days:      []
+
+    lichess:
+      broadcast_id:        "ANlMEGOD"   # tour_id, проверено через Chrome MCP
+      autodiscover_rounds: true
+
+    # Lazy-scroll профиль для secondary: только сводка дня + финальные места
+    algorithms:
+      preview:                     false
+      new_game:                    false
+      pulse:                       false
+      eval_swing:                  false
+      opening_15min:               false
+      turning_point:               false
+      round_summary:               false
+      game_over_post:              false
+      final_standings_with_places: true
+      hourly_recap:                false
+      daily_digest:                true
+
+    params:
+      pulse_intervals: []
+
+    # Игроки заполнить в Фазе 2 (бот всё равно нормализует имена через PGN
+    # tags — если не указано, имя выводится латиницей как есть).
+    players: {}
+
+  # ─── GCT этап 1 (продолжение): Blitz-секция, 8–10 мая ───────────────
+  gct_poland_2026_blitz:
+    active:         false
+    coverage_tier:  secondary
+    display_name:   "GCT Super Blitz Poland 2026"
+    short_name:     "GCT Poland Blitz"
+    hashtag:        "#gct_poland"
+    emoji:          "🇵🇱"
+    qualifies_for:  ""
+    start_date:     "2026-05-08"
+    end_date:       "2026-05-10"
+    total_rounds:   18
+
+    lichess:
+      broadcast_id:        ""           # Lichess опубликует ~7-8 мая
+      autodiscover_rounds: true
+
+    algorithms:
+      preview:                     false
+      new_game:                    false
+      pulse:                       false
+      eval_swing:                  false
+      opening_15min:               false
+      turning_point:               false
+      round_summary:               false
+      game_over_post:              false
+      final_standings_with_places: true
+      hourly_recap:                false
+      daily_digest:                true
+
+    params:
+      pulse_intervals: []
+
+    players: {}
+
+  # ─── GCT этап 2: Romania Chess Classic (Бухарест), 12–24 мая ────────
+  # Классика, 1 партия в день. По формату ближе к Sigeman, но решение
+  # primary/secondary зависит от того, что параллельно в это время идёт.
+  # На сейчас держим secondary; если в Фазе 2 окажется, что Бухарест —
+  # единственный активный супер-турнир, переключим на primary с lazy-scroll.
+  bucharest_chess_classic_2026:
+    active:         false
+    coverage_tier:  secondary
+    display_name:   "Romania Chess Classic 2026"
+    short_name:     "Bucharest"
+    hashtag:        "#bucharest"
+    emoji:          "🇷🇴"
+    qualifies_for:  ""
+    start_date:     "2026-05-12"
+    end_date:       "2026-05-24"
+    total_rounds:   9
+
+    lichess:
+      broadcast_id:        ""           # Lichess опубликует за 1-3 дня до старта
+      autodiscover_rounds: true
+
+    algorithms:
+      preview:                     false
+      new_game:                    false
+      pulse:                       false
+      eval_swing:                  false
+      opening_15min:               false
+      turning_point:               false
+      round_summary:               false
+      game_over_post:              false
+      final_standings_with_places: true
+      hourly_recap:                false
+      daily_digest:                true
+
+    params:
+      pulse_intervals: []
+
+    players: {}
+
+  # ─── GCT этап 3: Croatia Super Rapid & Blitz (Загреб), 29.06–06.07 ───
+  gct_croatia_2026:
+    active:         false
+    coverage_tier:  secondary
+    display_name:   "GCT Super Rapid & Blitz Croatia 2026"
+    short_name:     "GCT Croatia"
+    hashtag:        "#gct_croatia"
+    emoji:          "🇭🇷"
+    qualifies_for:  ""
+    start_date:     "2026-06-29"
+    end_date:       "2026-07-06"
+    total_rounds:   27               # 9 рапид + 18 блиц
+
+    lichess:
+      broadcast_id:        ""
+      autodiscover_rounds: true
+
+    algorithms:
+      preview:                     false
+      new_game:                    false
+      pulse:                       false
+      eval_swing:                  false
+      opening_15min:               false
+      turning_point:               false
+      round_summary:               false
+      game_over_post:              false
+      final_standings_with_places: true
+      hourly_recap:                false
+      daily_digest:                true
+
+    params:
+      pulse_intervals: []
+
+    players: {}
+
+  # ─── GCT этап 4: Saint Louis Rapid & Blitz, 31.07–07.08 ─────────────
+  gct_saint_louis_rapid_2026:
+    active:         false
+    coverage_tier:  secondary
+    display_name:   "Saint Louis Rapid & Blitz 2026"
+    short_name:     "STL Rapid&Blitz"
+    hashtag:        "#stl_rapid_blitz"
+    emoji:          "🇺🇸"
+    qualifies_for:  ""
+    start_date:     "2026-07-31"
+    end_date:       "2026-08-07"
+    total_rounds:   27               # 9 рапид + 18 блиц
+
+    lichess:
+      broadcast_id:        ""
+      autodiscover_rounds: true
+
+    algorithms:
+      preview:                     false
+      new_game:                    false
+      pulse:                       false
+      eval_swing:                  false
+      opening_15min:               false
+      turning_point:               false
+      round_summary:               false
+      game_over_post:              false
+      final_standings_with_places: true
+      hourly_recap:                false
+      daily_digest:                true
+
+    params:
+      pulse_intervals: []
+
+    players: {}
+
+  # ─── GCT этап 5: Sinquefield Cup (Сент-Луис, классика), 08–21.08 ────
+  # Главный супер-турнир GCT, классика 1 партия в день. По формату Sigeman.
+  # Если к августу ничего другого важного не идёт — переключить на primary.
+  sinquefield_cup_2026:
+    active:         false
+    coverage_tier:  secondary
+    display_name:   "Sinquefield Cup 2026"
+    short_name:     "Sinquefield"
+    hashtag:        "#sinquefield"
+    emoji:          "🏆"
+    qualifies_for:  ""
+    start_date:     "2026-08-08"
+    end_date:       "2026-08-21"
+    total_rounds:   9
+
+    lichess:
+      broadcast_id:        ""
+      autodiscover_rounds: true
+
+    algorithms:
+      preview:                     false
+      new_game:                    false
+      pulse:                       false
+      eval_swing:                  false
+      opening_15min:               false
+      turning_point:               false
+      round_summary:               false
+      game_over_post:              false
+      final_standings_with_places: true
+      hourly_recap:                false
+      daily_digest:                true
+
+    params:
+      pulse_intervals: []
+
+    players: {}
+
+  # ─── GCT этап 6: Tour Finals (Сент-Луис), 21–28 августа ─────────────
+  # Полуфиналы и финал между четырьмя лучшими по очкам тура.
+  gct_finals_2026:
+    active:         false
+    coverage_tier:  secondary
+    display_name:   "GCT Tour Finals 2026"
+    short_name:     "GCT Finals"
+    hashtag:        "#gct_finals"
+    emoji:          "🏁"
+    qualifies_for:  ""
+    start_date:     "2026-08-21"
+    end_date:       "2026-08-28"
+    total_rounds:   8
+
+    lichess:
+      broadcast_id:        ""
+      autodiscover_rounds: true
+
+    algorithms:
+      preview:                     false
+      new_game:                    false
+      pulse:                       false
+      eval_swing:                  false
+      opening_15min:               false
+      turning_point:               false
+      round_summary:               false
+      game_over_post:              false
+      final_standings_with_places: true
+      hourly_recap:                false
+      daily_digest:                true
+
+    params:
+      pulse_intervals: []
+
+    players: {}
 
 
   # ─── ШАБЛОН для нового турнира ───────────────────────────────────────

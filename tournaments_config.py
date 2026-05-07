@@ -56,6 +56,7 @@ KNOWN_ALGORITHMS = {
     "game_over_post",
     "final_standings_with_places",
     "hourly_recap",
+    "daily_digest",   # secondary-турниры: один пост в день со всеми результатами
 }
 
 REQUIRED_FIELDS = {
@@ -145,9 +146,15 @@ def _normalize_profile(tid: str, raw: dict, defaults: dict) -> dict:
     lichess = raw.get("lichess") or {}
     broadcast_id = lichess.get("broadcast_id") or ""
     round_ids_raw = lichess.get("round_ids") or []
-    if not broadcast_id and not round_ids_raw:
+    is_active_flag = bool(raw.get("active", True))
+    if not broadcast_id and not round_ids_raw and is_active_flag:
+        # Для active профилей хотя бы один из идентификаторов обязателен.
+        # Для active:false (заглушки на будущие этапы GCT и т.п.) — допускаем
+        # пустые поля: профиль документирует расписание, broadcast_id пропишется
+        # за пару дней до старта, когда Lichess опубликует трансляцию.
         raise ValueError(
-            f"[{tid}] нужен либо lichess.broadcast_id, либо хотя бы один round_ids"
+            f"[{tid}] нужен либо lichess.broadcast_id, либо хотя бы один round_ids "
+            f"(или поставь active: false, если это заглушка на будущее)"
         )
     round_ids = []
     for item in round_ids_raw:
@@ -157,6 +164,20 @@ def _normalize_profile(tid: str, raw: dict, defaults: dict) -> dict:
             )
         round_ids.append((str(item[0]), str(item[1])))
     autodiscover = bool(lichess.get("autodiscover_rounds", True))
+
+    # coverage_tier: primary | secondary
+    #   primary — основной турнир в фокусе, все 10 алгоритмов могут работать;
+    #             в bot.py становится «open»-слотом (один за раз).
+    #   secondary — параллельный, обрабатывается лёгким циклом
+    #             (Фаза 2: secondary_monitoring_step), типичный набор
+    #             алгоритмов: только daily_digest + final_standings.
+    # Дефолт «primary» сохраняет обратную совместимость со старыми профилями.
+    coverage_tier = str(raw.get("coverage_tier", "primary")).lower()
+    if coverage_tier not in ("primary", "secondary"):
+        raise ValueError(
+            f"[{tid}] coverage_tier = {coverage_tier!r}, ожидалось "
+            f"'primary' или 'secondary'"
+        )
 
     # Игроки. gender: 'm' (default) или 'f' — нужно для правильного рода
     # глаголов в комментариях смешанных по полу турниров.
@@ -181,6 +202,7 @@ def _normalize_profile(tid: str, raw: dict, defaults: dict) -> dict:
     return {
         "id": tid,
         "active":               bool(raw.get("active", True)),
+        "coverage_tier":        coverage_tier,
         "display_name":         raw["display_name"],
         "short_name":           raw.get("short_name", raw["display_name"]),
         "hashtag":              raw.get("hashtag", ""),
