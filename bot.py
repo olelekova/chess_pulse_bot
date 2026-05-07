@@ -2985,6 +2985,114 @@ async def monitoring_loop(bot: Bot):
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
+async def _amnesty_past_rounds() -> None:
+    """Амнистия УЖЕ ЗАВЕРШЁННЫХ раундов при старте контейнера.
+
+    Проблема: на Render-деплое контейнер пересоздаётся, in-memory state
+    (round_summary_done, games_over_sent, announced_rounds) сбрасывается.
+    Бот видит «партии вчерашнего тура завершены, я не отправлял итоги» —
+    и шлёт ретроактивно. Лечится тем, что на старте мы дёргаем все известные
+    раунды и помечаем уже завершённые как «обработанные», блокируя повтор.
+
+    Срабатывает только при свежем старте (когда сеты пусты).
+    """
+    if round_summary_done or w_round_summary_done:
+        # Не первый запуск этого контейнера — состояние уже накоплено.
+        return
+
+    open_rounds = list(KNOWN_ROUND_IDS)
+    women_rounds = list(WOMEN_KNOWN_ROUND_IDS)
+    if not open_rounds and not women_rounds:
+        return
+
+    today_utc = datetime.datetime.now(_UTC).date()
+    print(f"[Amnesty] Сканирую прошлые раунды (сегодня UTC {today_utc})")
+    headers = {"User-Agent": "CandidatesBot/1.0"}
+
+    def _round_date_from_pgn(pgn_text: str) -> datetime.date | None:
+        m = re.search(r'\[UTCDate "(\d{4})\.(\d{2})\.(\d{2})"\]', pgn_text)
+        if not m:
+            m = re.search(r'\[Date "(\d{4})\.(\d{2})\.(\d{2})"\]', pgn_text)
+        if not m:
+            return None
+        try:
+            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+
+    async def _scan(round_ids, summary_done, announced, pre_announced,
+                    over_sent, label):
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            for rid, rname in round_ids:
+                try:
+                    r = await client.get(
+                        f"https://lichess.org/api/broadcast/round/{rid}.pgn",
+                        headers=headers,
+                    )
+                    if r.status_code != 200 or not r.text.strip():
+                        continue
+                    pgns = split_pgn(r.text)
+                    if not pgns:
+                        continue
+                    round_date = _round_date_from_pgn(pgns[0])
+                    if round_date is None:
+                        # Без даты — на всякий случай пропускаем (не уверены, прошлое или будущее)
+                        continue
+
+                    # Будущий раунд — ничего не трогаем.
+                    if round_date > today_utc:
+                        continue
+
+                    all_finished = all(is_game_finished(p) for p in pgns)
+
+                    # Прошлые раунды — полная амнистия (включая round_summary_done).
+                    # Сегодняшний раунд — частичная: блокируем превью и
+                    # «обнаружение нового раунда» (announced_rounds), чтобы
+                    # send_round_start не выстрелил ретроактивно после рестарта,
+                    # но НЕ блокируем round_summary_done — пусть нормальный путь
+                    # отработает, когда все партии будут доиграны (если уже
+                    # доиграны и round_summary не успел уйти до рестарта,
+                    # обычный цикл его пошлёт через ~5 минут).
+                    is_past = round_date < today_utc
+
+                    announced.add(rid)
+                    pre_announced.add(rname)
+                    if is_past:
+                        summary_done.add(rid)
+                    # Завершённые партии этого раунда → games_over_sent
+                    for pgn in pgns:
+                        if not is_game_finished(pgn):
+                            continue
+                        gid = pgn_game_id(pgn)
+                        if label == "Women":
+                            gid = "w_" + gid
+                        over_sent.add(gid)
+
+                    state_str = "прошлый" if is_past else (
+                        "сегодня (доигран)" if all_finished else "сегодня (идёт)"
+                    )
+                    print(f"[Amnesty {label}] {rname} ({round_date}, {state_str}): "
+                          f"announced+pre_announced проставлены"
+                          + (", round_summary тоже" if is_past else ""))
+                except Exception as e:
+                    print(f"[Amnesty {label}] {rname} fetch error: {e}")
+
+    await _scan(
+        open_rounds,
+        round_summary_done, announced_rounds, pre_announced_rounds,
+        games_over_sent, "Open",
+    )
+    await _scan(
+        women_rounds,
+        w_round_summary_done, w_announced_rounds, w_pre_announced_rounds,
+        w_games_over_sent, "Women",
+    )
+    print(f"[Amnesty] Готово. Open: {len(round_summary_done)} раундов, "
+          f"{len(games_over_sent)} партий. "
+          f"Women: {len(w_round_summary_done)} раундов, "
+          f"{len(w_games_over_sent)} партий.")
+
+
 async def main():
     # Приложение с поддержкой команд
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -2998,6 +3106,9 @@ async def main():
         await app.updater.start_polling(drop_pending_updates=True)
         # Автодетект раундов женского турнира при старте
         await discover_women_rounds()
+        # Амнистия прошлых раундов: блокируем ретроактивные round_summary
+        # и game_over после рестарта контейнера (in-memory state стерт).
+        await _amnesty_past_rounds()
         print(f"✅ Бот запущен (Open + Women, {len(WOMEN_KNOWN_ROUND_IDS)} women rounds)")
         # Параллельно запускаем мониторинг
         await monitoring_loop(bot)
