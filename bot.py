@@ -10,6 +10,7 @@ import time
 import datetime
 import re
 import io
+from zoneinfo import ZoneInfo
 import chess
 import chess.engine
 import chess.pgn
@@ -272,6 +273,10 @@ try:
             "emoji":         _main_profile["emoji"],
             "qualifies_for": _main_profile["qualifies_for"],
             "total_rounds":  _main_profile["total_rounds"],
+            # Time UX: локальное время места турнира + Москва.
+            # Если эти поля пусты — render_round_time() откатится на «Лиссабон».
+            "local_tz":      _main_profile.get("local_tz", ""),
+            "local_city":    _main_profile.get("local_city", ""),
         })
         # Пульс-интервалы — перекрываем даже пустым списком,
         # чтобы профиль с pulse_intervals: [] реально отключал пульсы
@@ -1537,13 +1542,30 @@ async def send_round_start(bot: Bot, round_name: str, games_pgn: list[str]):
         w, b = gd["white"]["username"], gd["black"]["username"]
         pairs.append((w, b))
 
-    # Время начала по Лиссабону и Москве
+    # Время начала: локальное у места турнира + Москва.
+    # Локальная таймзона/город берутся из активного YAML-профиля (поля
+    # local_tz / local_city). Если их нет — fallback на «Лиссабон» (легаси,
+    # для совместимости со старыми деплоями без обновлённого YAML).
+    # Зимой/летом DST разруливается автоматически благодаря zoneinfo.
     start_utc = ROUND_SCHEDULE.get(round_name)
     time_line = ""
     if start_utc:
-        lisbon = (start_utc + datetime.timedelta(hours=1)).strftime("%H:%M")
-        moscow = (start_utc + datetime.timedelta(hours=3)).strftime("%H:%M")
-        time_line = f"\n🕐 *{lisbon} Лиссабон / {moscow} Москва*\n"
+        moscow_tz = ZoneInfo("Europe/Moscow")
+        moscow = start_utc.astimezone(moscow_tz).strftime("%H:%M")
+        local_tz_name = TOURNAMENT_PROFILES.get("open", {}).get("local_tz", "")
+        local_city    = TOURNAMENT_PROFILES.get("open", {}).get("local_city", "")
+        if local_tz_name and local_city:
+            try:
+                local = start_utc.astimezone(ZoneInfo(local_tz_name)).strftime("%H:%M")
+                time_line = f"\n🕐 *{local} {local_city} / {moscow} Москва*\n"
+            except Exception as e:
+                # Невалидное имя tz в YAML — лог + fallback
+                print(f"[Time UX] bad local_tz {local_tz_name!r}: {e}")
+                lisbon = (start_utc + datetime.timedelta(hours=1)).strftime("%H:%M")
+                time_line = f"\n🕐 *{lisbon} Лиссабон / {moscow} Москва*\n"
+        else:
+            lisbon = (start_utc + datetime.timedelta(hours=1)).strftime("%H:%M")
+            time_line = f"\n🕐 *{lisbon} Лиссабон / {moscow} Москва*\n"
 
     # Превью + стэндинги тянем параллельно (оба сетевые)
     preview = ""
@@ -2770,12 +2792,18 @@ async def women_monitoring_step(bot: Bot, now: float):
                         )
 
         # ── Итоги тура — когда все партии завершены ──
+        # add() ПОСЛЕ await: иначе сетевой сбой съедает пост навсегда (см.
+        # аналогичный фикс в монtorinroом цикле open-турнира выше).
         if (games_pgn
                 and round_id not in w_round_summary_done
                 and len(games_pgn) >= 2
                 and all(pgn_is_finished[p] for p in games_pgn)):
-            w_round_summary_done.add(round_id)
-            await send_women_round_summary(bot, round_name, games_pgn)
+            try:
+                await send_women_round_summary(bot, round_name, games_pgn)
+                w_round_summary_done.add(round_id)
+            except Exception as _e:
+                print(f"[women round_summary] {round_name} ({round_id}) "
+                      f"FAILED — повторим на следующем тике: {_e!r}")
 
     except Exception as e:
         print(f"[Women] Loop error: {e}")
@@ -2957,12 +2985,22 @@ async def monitoring_loop(bot: Bot):
                                                     eval_data=eval_data, clock_info=pulse_clocks)
 
             # ── Итоговый разбор тура ─────────────────────────
+            # ВАЖНО: round_summary_done.add() ПОСЛЕ успешного await.
+            # Раньше add() стоял до await — если send_round_summary падал в
+            # сетевой ошибке (Anthropic 5xx, Lichess таймаут), раунд помечался
+            # как обработанный, но пост никогда не уходил. Так у Sigeman
+            # 7 мая 2026 пропали итоги Round 7 + финальный пост с местами.
             if (games_pgn
                     and round_id not in round_summary_done
                     and len(games_pgn) >= 2
                     and all(pgn_is_finished[p] for p in games_pgn)):  # используем кеш
-                round_summary_done.add(round_id)
-                await send_round_summary(bot, round_name, games_pgn)
+                try:
+                    await send_round_summary(bot, round_name, games_pgn)
+                    round_summary_done.add(round_id)
+                except Exception as _e:
+                    print(f"[round_summary] {round_name} ({round_id}) "
+                          f"FAILED — НЕ помечаем как done, попробуем снова "
+                          f"на следующем тике: {_e!r}")
 
         except Exception as e:
             print(f"Loop error: {e}")
@@ -3006,6 +3044,14 @@ async def _amnesty_past_rounds() -> None:
         return
 
     today_utc = datetime.datetime.now(_UTC).date()
+    yesterday_utc = today_utc - datetime.timedelta(days=1)
+    # «Свежий» раунд = вчерашний или сегодняшний. Для них не ставим
+    # round_summary_done — даём шанс монитор-циклу прислать round_summary,
+    # если вчера он не успел из-за транзиентной ошибки (Sigeman 7 мая 2026
+    # как раз был такой случай: Anthropic 5xx или Lichess таймаут съели пост).
+    # Trade-off: если round_summary вчера всё-таки прошёл, после деплоя
+    # может прилететь дубль. Это лесшего зла — лучше один лишний пост, чем
+    # пропущенный финал турнира.
     print(f"[Amnesty] Сканирую прошлые раунды (сегодня UTC {today_utc})")
     headers = {"User-Agent": "CandidatesBot/1.0"}
 
@@ -3045,19 +3091,16 @@ async def _amnesty_past_rounds() -> None:
 
                     all_finished = all(is_game_finished(p) for p in pgns)
 
-                    # Прошлые раунды — полная амнистия (включая round_summary_done).
-                    # Сегодняшний раунд — частичная: блокируем превью и
-                    # «обнаружение нового раунда» (announced_rounds), чтобы
-                    # send_round_start не выстрелил ретроактивно после рестарта,
-                    # но НЕ блокируем round_summary_done — пусть нормальный путь
-                    # отработает, когда все партии будут доиграны (если уже
-                    # доиграны и round_summary не успел уйти до рестарта,
-                    # обычный цикл его пошлёт через ~5 минут).
-                    is_past = round_date < today_utc
+                    # Старые раунды (>= 2 дня назад) — полная амнистия.
+                    # Свежие (вчера/сегодня) — частичная: блокируем превью и
+                    # «обнаружение нового раунда» (announced_rounds), но НЕ
+                    # round_summary_done — даём монитор-циклу шанс отправить
+                    # пропущенные итоги, если вчера сетевой сбой их съел.
+                    is_recent = round_date >= yesterday_utc   # вчера или сегодня
 
                     announced.add(rid)
                     pre_announced.add(rname)
-                    if is_past:
+                    if not is_recent:
                         summary_done.add(rid)
                     # Завершённые партии этого раунда → games_over_sent
                     for pgn in pgns:
@@ -3068,12 +3111,18 @@ async def _amnesty_past_rounds() -> None:
                             gid = "w_" + gid
                         over_sent.add(gid)
 
-                    state_str = "прошлый" if is_past else (
-                        "сегодня (доигран)" if all_finished else "сегодня (идёт)"
-                    )
-                    print(f"[Amnesty {label}] {rname} ({round_date}, {state_str}): "
+                    if is_recent:
+                        state_str = ("сегодня" if round_date == today_utc
+                                     else "вчера")
+                        if all_finished:
+                            state_str += " (доигран — round_summary возможен)"
+                        else:
+                            state_str += " (идёт)"
+                    else:
+                        state_str = f"{round_date} (старый)"
+                    print(f"[Amnesty {label}] {rname} {state_str}: "
                           f"announced+pre_announced проставлены"
-                          + (", round_summary тоже" if is_past else ""))
+                          + ("" if is_recent else ", round_summary тоже"))
                 except Exception as e:
                     print(f"[Amnesty {label}] {rname} fetch error: {e}")
 

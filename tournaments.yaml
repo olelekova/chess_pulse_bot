@@ -102,6 +102,8 @@ tournaments:
     display_name:  "Турнир претендентов"
     emoji:         "🏆"
     qualifies_for: "матч за звание чемпиона мира 2027"
+    local_tz:      "Europe/Lisbon"   # турнир проводился в Лиссабоне
+    local_city:    "Лиссабон"
     start_date:    "2026-03-29"
     end_date:      "2026-04-15"
     total_rounds:  14
@@ -158,6 +160,8 @@ tournaments:
     display_name:  "Женский турнир претендентов"
     emoji:         "♛"
     qualifies_for: "матч за звание чемпионки мира 2027"
+    local_tz:      "Europe/Lisbon"
+    local_city:    "Лиссабон"
     start_date:    "2026-03-29"
     end_date:      "2026-04-15"
     total_rounds:  14
@@ -224,6 +228,8 @@ tournaments:
     hashtag:       "#tepe_sigeman"
     emoji:         "🇸🇪"
     qualifies_for: ""                    # супер-турнир без квалификации
+    local_tz:      "Europe/Stockholm"    # Мальмё, шведское время (CET/CEST)
+    local_city:    "Мальмё"
     start_date:    "2026-05-01"
     end_date:      "2026-05-07"
     total_rounds:  7
@@ -308,6 +314,8 @@ tournaments:
     hashtag:        "#gct_poland"
     emoji:          "🇵🇱"
     qualifies_for:  ""
+    local_tz:       "Europe/Warsaw"
+    local_city:     "Варшава"
     start_date:     "2026-05-03"
     end_date:       "2026-05-07"     # rapid-секция, 9 туров
     total_rounds:   9
@@ -347,6 +355,8 @@ tournaments:
     hashtag:        "#gct_poland"
     emoji:          "🇵🇱"
     qualifies_for:  ""
+    local_tz:       "Europe/Warsaw"
+    local_city:     "Варшава"
     start_date:     "2026-05-08"
     end_date:       "2026-05-10"
     total_rounds:   18
@@ -386,6 +396,8 @@ tournaments:
     hashtag:        "#bucharest"
     emoji:          "🇷🇴"
     qualifies_for:  ""
+    local_tz:       "Europe/Bucharest"
+    local_city:     "Бухарест"
     start_date:     "2026-05-12"
     end_date:       "2026-05-24"
     total_rounds:   9
@@ -421,6 +433,8 @@ tournaments:
     hashtag:        "#gct_croatia"
     emoji:          "🇭🇷"
     qualifies_for:  ""
+    local_tz:       "Europe/Zagreb"
+    local_city:     "Загреб"
     start_date:     "2026-06-29"
     end_date:       "2026-07-06"
     total_rounds:   27               # 9 рапид + 18 блиц
@@ -456,6 +470,8 @@ tournaments:
     hashtag:        "#stl_rapid_blitz"
     emoji:          "🇺🇸"
     qualifies_for:  ""
+    local_tz:       "America/Chicago"
+    local_city:     "Сент-Луис"
     start_date:     "2026-07-31"
     end_date:       "2026-08-07"
     total_rounds:   27               # 9 рапид + 18 блиц
@@ -493,6 +509,8 @@ tournaments:
     hashtag:        "#sinquefield"
     emoji:          "🏆"
     qualifies_for:  ""
+    local_tz:       "America/Chicago"
+    local_city:     "Сент-Луис"
     start_date:     "2026-08-08"
     end_date:       "2026-08-21"
     total_rounds:   9
@@ -529,6 +547,8 @@ tournaments:
     hashtag:        "#gct_finals"
     emoji:          "🏁"
     qualifies_for:  ""
+    local_tz:       "America/Chicago"
+    local_city:     "Сент-Луис"
     start_date:     "2026-08-21"
     end_date:       "2026-08-28"
     total_rounds:   8
@@ -564,6 +584,11 @@ tournaments:
     display_name:  "Название турнира"   # как показывать в постах
     emoji:         "♟️"
     qualifies_for: ""                    # "выход в Кандидаты-2027" или пусто
+    # Локальная таймзона + русское имя города места проведения.
+    # Используется в превью тура: «{local_time} {local_city} / {moscow} Москва».
+    # Если не указано — fallback на «Лиссабон» (служебно, для совместимости).
+    local_tz:      "Europe/Moscow"       # IANA tz, латиницей. См. https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+    local_city:    "Город"                # русское имя для поста
     start_date:    "YYYY-MM-DD"
     end_date:      "YYYY-MM-DD"
     total_rounds:  9

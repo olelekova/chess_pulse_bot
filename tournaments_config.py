@@ -208,6 +208,13 @@ def _normalize_profile(tid: str, raw: dict, defaults: dict) -> dict:
         "hashtag":              raw.get("hashtag", ""),
         "emoji":                raw.get("emoji", "♟️"),
         "qualifies_for":        raw.get("qualifies_for", ""),
+        # Локальная таймзона + русское название города места проведения.
+        # Используется в send_round_start для рендера времени старта тура
+        # как «{HH:MM} {local_city} / {HH:MM} Москва».
+        # Если оба поля пустые — bot.py откатывается на старый формат
+        # «{HH:MM+1} Лиссабон» (для совместимости со старыми профилями).
+        "local_tz":             str(raw.get("local_tz") or ""),
+        "local_city":           str(raw.get("local_city") or ""),
         "start_date":           start,
         "end_date":             end,
         "total_rounds":         int(raw["total_rounds"]),
