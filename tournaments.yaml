@@ -383,46 +383,77 @@ tournaments:
 
     players: {}
 
-  # ─── GCT этап 2: Romania Chess Classic (Бухарест), 12–24 мая ────────
-  # Классика, 1 партия в день. По формату ближе к Sigeman, но решение
-  # primary/secondary зависит от того, что параллельно в это время идёт.
-  # На сейчас держим secondary; если в Фазе 2 окажется, что Бухарест —
-  # единственный активный супер-турнир, переключим на primary с lazy-scroll.
+  # ─── GCT этап 2: Superbet Chess Classic Romania 2026 (Бухарест) ─────
+  # 14–23 мая 2026, классика, 10 игроков, 1 круг = 9 туров, 1 партия в день.
+  # Контроль: 90+30/40 + 30+30s. Day off: 19 мая.
+  # Туры 1–8 в 14:30 EEST = 11:30 UTC; тур 9 в 12:30 EEST = 09:30 UTC
+  # (per-round override не разруливаем — превью последнего тура уйдёт на 2ч позже).
+  #
+  # ⚡ Sigeman закончился 7 мая, у нас сейчас НЕТ другого активного primary
+  # супер-турнира. Поэтому Бухарест занимает Open-слот с пресетом light
+  # (lazy-scroll, ~5–6 постов на тур), как и Sigeman.
   bucharest_chess_classic_2026:
-    active:         false
-    coverage_tier:  secondary
-    display_name:   "Romania Chess Classic 2026"
-    short_name:     "Bucharest"
-    hashtag:        "#bucharest"
+    active:         true
+    coverage_tier:  primary
+    display_name:   "Superbet Chess Classic Romania 2026"
+    short_name:     "GCT Romania"
+    hashtag:        "#gct_romania"
     emoji:          "🇷🇴"
-    qualifies_for:  ""
+    qualifies_for:  ""                  # супер-турнир GCT, не квалификация
     local_tz:       "Europe/Bucharest"
     local_city:     "Бухарест"
-    start_date:     "2026-05-12"
-    end_date:       "2026-05-24"
+    start_date:     "2026-05-14"
+    end_date:       "2026-05-23"
     total_rounds:   9
+    rest_days:      ["2026-05-19"]
 
     lichess:
-      broadcast_id:        ""           # Lichess опубликует за 1-3 дня до старта
+      broadcast_id: "p3ctK4xS"
       autodiscover_rounds: true
+      # Round IDs подтверждены через Lichess API /api/broadcast/p3ctK4xS:
+      round_ids:
+        - ["Vos7UzKR", "Round 1"]
+        - ["FDb3eO7v", "Round 2"]
+        - ["cjn5R98v", "Round 3"]
+        - ["E8hAb7kf", "Round 4"]
+        - ["6Lai6Zhg", "Round 5"]
+        - ["lq6N6nfE", "Round 6"]
+        - ["Iw3wAwFB", "Round 7"]
+        - ["n7txaQms", "Round 8"]
+        - ["084VvjQm", "Round 9"]
 
+    # Lazy-scroll профиль (как Sigeman): preview + редкие swing + сводка тура
+    # + разбор лучшей партии + финальные места.
     algorithms:
-      preview:                     false
+      preview:                     true
       new_game:                    false
       pulse:                       false
-      eval_swing:                  false
+      eval_swing:                  true     # только на громких swing-ах
       opening_15min:               false
-      turning_point:               false
-      round_summary:               false
-      game_over_post:              false
+      turning_point:               true     # = разбор ОДНОЙ лучшей партии тура
+      round_summary:               true
+      game_over_post:              false    # → батчем в round_summary
       final_standings_with_places: true
       hourly_recap:                false
-      daily_digest:                true
 
     params:
       pulse_intervals: []
+      eval_swing_threshold: 2.0       # как в Sigeman — режем шум
+      eval_swing_cooldown_moves: 10
+      round_start_utc: "11:30"        # 14:30 Бухарест (EEST). Тур 9 в 09:30 UTC,
+                                      # per-round override не делаем.
 
-    players: {}
+    players:
+      Caruana:           { ru: "Каруана",       chess_com: "fabiano-caruana" }
+      Deac:              { ru: "Деак",          chess_com: "boggycz" }
+      Firouzja:          { ru: "Фирузджа",      chess_com: "firouzja2003" }
+      Giri:              { ru: "Гири",          chess_com: "anish-giri" }
+      Keymer:            { ru: "Кеймер",        chess_com: "vincentkeymer" }
+      Praggnanandhaa:    { ru: "Прагг",         chess_com: "praggnanandhaa" }
+      Sindarov:          { ru: "Синдаров",      chess_com: "sindarov" }
+      So:                { ru: "Уэсли Со",      chess_com: "gmwso" }
+      "Vachier-Lagrave": { ru: "МВЛ",           chess_com: "lyonbeast" }
+      "Van Foreest":     { ru: "Ван Форест",    chess_com: "jordennl" }
 
   # ─── GCT этап 3: Croatia Super Rapid & Blitz (Загреб), 29.06–06.07 ───
   gct_croatia_2026:
