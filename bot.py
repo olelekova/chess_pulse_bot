@@ -3143,27 +3143,25 @@ async def _amnesty_past_rounds() -> None:
 
 
 async def main():
-    # Приложение с поддержкой команд
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("standings", cmd_standings))
-    app.add_handler(CommandHandler("standings_women", cmd_standings_women))
+    # ВАЖНО: только posting-режим, без updater.start_polling().
+    # Раньше при rolling-deploy'е Render новый контейнер стартовал, пока
+    # старый ещё держал getUpdates → telegram.error.Conflict → краш всего
+    # Application и monitoring_loop тоже не отправлял посты (15 мая 2026
+    # пропали итоги Round 1 и весь день Round 2 Бухареста).
+    # Бот ничего не слушает в чате — только пишет. Слэш-команды
+    # /standings и /standings_women отключены. Если когда-то понадобятся
+    # обратно, восстановить надо так, чтобы padding в Application не валил
+    # monitoring_loop (gather с return_exceptions=True).
+    bot = Bot(TELEGRAM_TOKEN)
 
-    bot = app.bot
-
-    async with app:
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        # Автодетект раундов женского турнира при старте
-        await discover_women_rounds()
-        # Амнистия прошлых раундов: блокируем ретроактивные round_summary
-        # и game_over после рестарта контейнера (in-memory state стерт).
-        await _amnesty_past_rounds()
-        print(f"✅ Бот запущен (Open + Women, {len(WOMEN_KNOWN_ROUND_IDS)} women rounds)")
-        # Параллельно запускаем мониторинг
-        await monitoring_loop(bot)
-        # monitoring_loop бесконечный — до сюда не доходим при штатной работе
-        await app.updater.stop()
-        await app.stop()
+    # Автодетект раундов женского турнира при старте
+    await discover_women_rounds()
+    # Амнистия прошлых раундов: блокируем ретроактивные round_summary
+    # и game_over после рестарта контейнера (in-memory state стерт).
+    await _amnesty_past_rounds()
+    print(f"✅ Бот запущен (Open + Women, {len(WOMEN_KNOWN_ROUND_IDS)} women rounds)")
+    # monitoring_loop бесконечный
+    await monitoring_loop(bot)
 
 
 if __name__ == "__main__":
