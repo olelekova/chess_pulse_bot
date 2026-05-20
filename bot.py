@@ -3067,7 +3067,13 @@ async def _amnesty_past_rounds() -> None:
             return None
 
     async def _scan(round_ids, summary_done, announced, pre_announced,
-                    over_sent, label):
+                    over_sent, label, schedule_map):
+        # schedule_map: dict[round_name → datetime.date], дата старта тура
+        # из YAML-расписания. Это надёжный источник, в отличие от [Date] тегов
+        # в PGN — Lichess для GCT Romania 2026 проставила там левые даты
+        # (2026.05.10 на первой партии каждого тура и 2026.05.14 на остальных,
+        # хотя играли 14–18 мая). Раньше амнистия верила PGN-датам, считала
+        # все 5 туров «старыми» и блокировала round_summary навсегда.
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             for rid, rname in round_ids:
                 try:
@@ -3080,7 +3086,9 @@ async def _amnesty_past_rounds() -> None:
                     pgns = split_pgn(r.text)
                     if not pgns:
                         continue
-                    round_date = _round_date_from_pgn(pgns[0])
+                    # Приоритет: дата из YAML-расписания. Fallback: PGN [Date].
+                    sched_dt = schedule_map.get(rname)
+                    round_date = sched_dt.date() if sched_dt else _round_date_from_pgn(pgns[0])
                     if round_date is None:
                         # Без даты — на всякий случай пропускаем (не уверены, прошлое или будущее)
                         continue
@@ -3129,12 +3137,12 @@ async def _amnesty_past_rounds() -> None:
     await _scan(
         open_rounds,
         round_summary_done, announced_rounds, pre_announced_rounds,
-        games_over_sent, "Open",
+        games_over_sent, "Open", ROUND_SCHEDULE,
     )
     await _scan(
         women_rounds,
         w_round_summary_done, w_announced_rounds, w_pre_announced_rounds,
-        w_games_over_sent, "Women",
+        w_games_over_sent, "Women", WOMEN_ROUND_SCHEDULE,
     )
     print(f"[Amnesty] Готово. Open: {len(round_summary_done)} раундов, "
           f"{len(games_over_sent)} партий. "
@@ -3159,7 +3167,18 @@ async def main():
     # Амнистия прошлых раундов: блокируем ретроактивные round_summary
     # и game_over после рестарта контейнера (in-memory state стерт).
     await _amnesty_past_rounds()
-    print(f"✅ Бот запущен (Open + Women, {len(WOMEN_KNOWN_ROUND_IDS)} women rounds)")
+    # Стартовая строка, по которой видно в Render-логах, какой именно
+    # турнир бот подцепил в Open-слоте. Раньше было намертво «Open + Women» —
+    # дезориентирующе после Кандидатов.
+    if _main_profile:
+        open_descr = (f"{_main_profile['display_name']} "
+                      f"(broadcast={_main_profile['broadcast_id']}, "
+                      f"{len(_main_profile['round_ids'])} туров)")
+    else:
+        open_descr = "нет активного primary"
+    print(f"✅ Бот запущен. Open-слот: {open_descr}. "
+          f"Women rounds: {len(WOMEN_KNOWN_ROUND_IDS)}. "
+          f"Secondary: {len(_active_secondaries)}.")
     # monitoring_loop бесконечный
     await monitoring_loop(bot)
 
