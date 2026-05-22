@@ -443,6 +443,13 @@ tournaments:
       round_start_utc: "11:30"        # 14:30 Бухарест (EEST). Тур 9 в 09:30 UTC,
                                       # per-round override не делаем.
 
+    # Игроки, выбывшие из турнира посреди (травма/снятие).
+    # Их партии с 0 ходов бот считает walkover'ом, а не «тур ещё не начался» —
+    # иначе round_summary застрянет на ожидании последней «партии».
+    # Фируджа снялся перед Round 6 (после R5, 18 мая) из-за травмы.
+    withdrawn:
+      - Firouzja
+
     players:
       Caruana:           { ru: "Каруана",       chess_com: "fabiano-caruana" }
       Deac:              { ru: "Деак",          chess_com: "boggycz" }

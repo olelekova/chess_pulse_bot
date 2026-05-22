@@ -179,6 +179,14 @@ def _normalize_profile(tid: str, raw: dict, defaults: dict) -> dict:
             f"'primary' или 'secondary'"
         )
 
+    # Снявшиеся посреди турнира (травма/отказ). Фамилия из PGN, как ключи players.
+    # Используется в bot.py чтобы trahtовать 0-ходовые партии этих игроков
+    # как walkover (round_summary не залипает на «партия не началась»).
+    withdrawn_raw = raw.get("withdrawn") or []
+    if not isinstance(withdrawn_raw, list):
+        raise ValueError(f"[{tid}] withdrawn должен быть list строк, а не {type(withdrawn_raw).__name__}")
+    withdrawn = [str(s) for s in withdrawn_raw]
+
     # Игроки. gender: 'm' (default) или 'f' — нужно для правильного рода
     # глаголов в комментариях смешанных по полу турниров.
     players = {}
@@ -225,6 +233,7 @@ def _normalize_profile(tid: str, raw: dict, defaults: dict) -> dict:
         "algorithms":           algos,
         "params":               params,
         "players":              players,
+        "withdrawn":            withdrawn,
         "tiebreak_rules":       raw.get("tiebreak_rules", params.get("tiebreak_rules", [])),
     }
 

@@ -127,6 +127,12 @@ PLAYER_CHESS_COM = {
     "Bluebaum":       "bluebaum",
 }
 
+# Игроки, выбывшие посреди турнира (травма/отказ). Перезаписывается из
+# YAML-профиля ниже. Используется в is_walkover_game() — партия с 0 ходов,
+# где один из игроков в этом сете, считается walkover'ом и не блокирует
+# round_summary ожиданием «когда же она начнётся».
+WITHDRAWN_PLAYERS: set[str] = set()
+
 # ═══ ЖЕНСКИЙ ТУРНИР ПРЕТЕНДЕНТОВ 2026 ═════════════════════════
 # Облегчённый мониторинг: превью тура → пульс 1ч → пульс 2ч → итоги
 WOMEN_BROADCAST_ID = "xj4qM8Nw"   # ID серии (не раунда!)
@@ -266,6 +272,10 @@ try:
             if _info.get("chess_com"):
                 PLAYER_CHESS_COM[_surname] = _info["chess_com"]
         OPEN_PLAYERS_RU = {info["ru"] for info in _main_profile["players"].values()}
+        # Снявшиеся посреди турнира (травма/отказ) — фамилии из PGN.
+        # Используется в is_walkover_game(): партия с 0 ходов, где один из
+        # игроков снят, считается walkover'ом и не блокирует round_summary.
+        WITHDRAWN_PLAYERS = set(_main_profile.get("withdrawn", []))
         # Профиль алгоритмов
         TOURNAMENT_PROFILES["open"].update({
             **_main_profile["algorithms"],
@@ -366,17 +376,26 @@ async def get_active_round_id() -> tuple[str | None, str | None]:
                     games = split_pgn(r.text)
                     if not games:
                         continue
-                    # Раунд считается начавшимся только если есть ходы хотя бы в одной партии
-                    started = [g for g in games if count_moves_pgn(g) > 0]
+                    # Раунд считается начавшимся только если есть ходы хотя бы
+                    # в одной партии ИЛИ есть walkover (значит остальные пары
+                    # тоже стартовали).
+                    started = [g for g in games if count_moves_pgn(g) > 0 or is_walkover_game(g)]
                     if not started:
-                        print(f"{rname} ({rid}): {len(games)} партий, ещё не началось")
+                        # 0 ходов и никто не снят — тур правда ещё не стартовал.
+                        # Если такое держится несколько часов после
+                        # ROUND_SCHEDULE — будет видно в логах, разбираемся.
+                        zero_count = len(games)
+                        print(f"{rname} ({rid}): {zero_count} партий, 0 ходов везде "
+                              f"и нет walkover'ов — тур ещё не стартовал?")
                         continue
-                    finished_count = sum(1 for g in games if is_game_finished(g))
-                    print(f"{rname} ({rid}): {len(games)} партий, {finished_count} завершено")
-                    # Раунд активен если хотя бы одна партия ещё не завершена
-                    if finished_count < len(games):
+                    resolved_count = sum(1 for g in games if is_game_resolved(g))
+                    walkovers = sum(1 for g in games if is_walkover_game(g))
+                    print(f"{rname} ({rid}): {len(games)} партий, "
+                          f"{resolved_count} закрыто (из них walkover'ов: {walkovers})")
+                    # Раунд активен если хотя бы одна партия ещё не закрыта
+                    if resolved_count < len(games):
                         return rid, rname
-                    # Все завершены — запоминаем как самый поздний завершённый
+                    # Все закрыты — запоминаем как самый поздний закрытый раунд
                     if latest_finished is None:
                         latest_finished = (rid, rname)
                 elif r.status_code == 404:
@@ -1338,6 +1357,41 @@ def is_game_finished(pgn_text: str) -> bool:
     return bool(m) and m.group(1) in ("1-0", "0-1", "1/2-1/2")
 
 
+def is_walkover_game(pgn_text: str) -> bool:
+    """Партия — форфит снявшегося игрока.
+
+    Истина если: (а) в партии 0 полных ходов; (б) один из игроков значится
+    в WITHDRAWN_PLAYERS (через normalize-fallback по surname).
+
+    Зачем нужно: когда игрок снимается из турнира посреди (например Фируджа
+    после R5 Бухареста 2026), Lichess в PGN следующего тура оставляет
+    пустую партию. Без этого хелпера бот вечно ждёт, что «партия начнётся»,
+    и блокирует round_summary всего тура.
+    """
+    if not WITHDRAWN_PLAYERS:
+        return False
+    if count_moves_pgn(pgn_text) > 0:
+        return False
+    white_m = re.search(r'\[White "([^"]+)"\]', pgn_text)
+    black_m = re.search(r'\[Black "([^"]+)"\]', pgn_text)
+    for m in (white_m, black_m):
+        if not m:
+            continue
+        raw = m.group(1).strip()
+        # Сначала по сплиту на запятую, потом первое слово — тот же подход,
+        # что у normalize_player_name (см. строка ~442).
+        for candidate in (raw.split(",")[0].strip(), raw.split()[0].rstrip(",.")):
+            if candidate in WITHDRAWN_PLAYERS:
+                return True
+    return False
+
+
+def is_game_resolved(pgn_text: str) -> bool:
+    """Партия «разрешена» — либо нормально доиграна, либо walkover.
+    Используется в проверках «все партии тура закрыты, можно слать итоги»."""
+    return is_game_finished(pgn_text) or is_walkover_game(pgn_text)
+
+
 def get_game_result(pgn_text: str) -> str:
     m = re.search(r'\[Result "([^"]+)"\]', pgn_text)
     return m.group(1) if m else "*"
@@ -1368,6 +1422,22 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
         n_moves_str = str(n_moves) if n_moves else "?"
         opening = info.get("opening") or info.get("eco") or "неизвестно"
         first_moves = " ".join(info.get("first_moves", [])[:6])
+
+        # Walkover: один из игроков снят с турнира. Рендерим явной строкой
+        # без диаграмм и переломных моментов (их нет — партия не игралась).
+        if is_walkover_game(pgn):
+            if res == "1-0":
+                result_line = f"⚠️ 1-0 *{w} – {b}* (форфит, {b} снят с турнира)"
+            elif res == "0-1":
+                result_line = f"⚠️ 0-1 *{w} – {b}* (форфит, {w} снят с турнира)"
+            else:
+                result_line = f"⚠️ — *{w} – {b}* (партия не сыграна, снятие с турнира)"
+            results_lines.append(result_line)
+            results_for_claude.append(
+                f"• {w} vs {b}: форфит — один из игроков снят с турнира, партия не игралась."
+            )
+            continue
+
         if res == "1-0":
             result_line = f"⚪️ 1-0 *{w} – {b}* ({n_moves_str} ходов)"
         elif res == "0-1":
@@ -2836,14 +2906,27 @@ async def monitoring_loop(bot: Bot):
             # и не все партии уже завершены (раунд не прошлый).
             # Если бот перезапустился в середине тура (ходов уже > 5) — тихо помечаем
             # раунд как объявленный, чтобы не дублировать анонс после деплоя.
-            # Кешируем move_count и is_finished один раз на весь цикл
+            # Кешируем move_count и is_finished один раз на весь цикл.
+            # pgn_is_finished — настоящее окончание (Result != *), без walkover'ов.
+            # pgn_is_resolved — «партия закрыта»: либо доиграна, либо снятие. Для
+            # вопросов «можно ли слать round_summary?» нужен resolved, чтобы
+            # 0-ходовая партия снявшегося Фируджи не блокировала тур навечно.
             pgn_move_counts  = {p: count_moves_pgn(p) for p in games_pgn}
             pgn_is_finished  = {p: is_game_finished(p) for p in games_pgn}
+            pgn_is_walkover  = {p: is_walkover_game(p) for p in games_pgn}
+            pgn_is_resolved  = {p: pgn_is_finished[p] or pgn_is_walkover[p]
+                                for p in games_pgn}
+            # Лог по walkover'ам (помогает в Render-логах отличить «тур не
+            # стартовал» от «один из игроков снят»).
+            wo_pgns = [p for p, w in pgn_is_walkover.items() if w]
+            if wo_pgns:
+                wo_pairs = [pgn_game_id(p) for p in wo_pgns]
+                print(f"[{round_name}] walkover'ы: {wo_pairs}")
 
             games_started = [p for p in games_pgn if pgn_move_counts[p] > 0]
             if (games_started
                     and round_id not in announced_rounds
-                    and not all(pgn_is_finished[p] for p in games_pgn)):
+                    and not all(pgn_is_resolved[p] for p in games_pgn)):
                 announced_rounds.add(round_id)
                 max_moves = max(pgn_move_counts[p] for p in games_started)
                 if max_moves <= 5:
@@ -2993,7 +3076,7 @@ async def monitoring_loop(bot: Bot):
             if (games_pgn
                     and round_id not in round_summary_done
                     and len(games_pgn) >= 2
-                    and all(pgn_is_finished[p] for p in games_pgn)):  # используем кеш
+                    and all(pgn_is_resolved[p] for p in games_pgn)):  # walkover тоже = «закрыто»
                 try:
                     await send_round_summary(bot, round_name, games_pgn)
                     round_summary_done.add(round_id)
@@ -3097,7 +3180,7 @@ async def _amnesty_past_rounds() -> None:
                     if round_date > today_utc:
                         continue
 
-                    all_finished = all(is_game_finished(p) for p in pgns)
+                    all_finished = all(is_game_resolved(p) for p in pgns)
 
                     # Старые раунды (>= 2 дня назад) — полная амнистия.
                     # Свежие (вчера/сегодня) — частичная: блокируем превью и
