@@ -57,6 +57,7 @@ KNOWN_ALGORITHMS = {
     "final_standings_with_places",
     "hourly_recap",
     "daily_digest",   # secondary-турниры: один пост в день со всеми результатами
+    "upset_analysis", # bracket-турниры: подробный разбор сенсационных матчей
 }
 
 REQUIRED_FIELDS = {
@@ -146,14 +147,21 @@ def _normalize_profile(tid: str, raw: dict, defaults: dict) -> dict:
     lichess = raw.get("lichess") or {}
     broadcast_id = lichess.get("broadcast_id") or ""
     round_ids_raw = lichess.get("round_ids") or []
+    # Автопоиск broadcast_id через ГРУППУ бродкастов Lichess: указываем id
+    # любого уже известного tour'а той же серии (group_probe_id), бот тянет
+    # /api/broadcast/{probe} → .group.tours и выбирает новый tour, имя
+    # которого не попадает под tour_name_exclude. Нужно для турниров, чей
+    # бродкаст Lichess публикует в последний момент (EWC main event).
+    group_probe_id = str(lichess.get("group_probe_id") or "")
+    tour_name_exclude = [str(s) for s in (lichess.get("tour_name_exclude") or [])]
     is_active_flag = bool(raw.get("active", True))
-    if not broadcast_id and not round_ids_raw and is_active_flag:
+    if not broadcast_id and not round_ids_raw and not group_probe_id and is_active_flag:
         # Для active профилей хотя бы один из идентификаторов обязателен.
         # Для active:false (заглушки на будущие этапы GCT и т.п.) — допускаем
         # пустые поля: профиль документирует расписание, broadcast_id пропишется
         # за пару дней до старта, когда Lichess опубликует трансляцию.
         raise ValueError(
-            f"[{tid}] нужен либо lichess.broadcast_id, либо хотя бы один round_ids "
+            f"[{tid}] нужен lichess.broadcast_id, round_ids или group_probe_id "
             f"(или поставь active: false, если это заглушка на будущее)"
         )
     round_ids = []
@@ -172,11 +180,15 @@ def _normalize_profile(tid: str, raw: dict, defaults: dict) -> dict:
     #             (Фаза 2: secondary_monitoring_step), типичный набор
     #             алгоритмов: только daily_digest + final_standings.
     # Дефолт «primary» сохраняет обратную совместимость со старыми профилями.
+    #   bracket — матчевый/сеточный турнир (даблэлиминейшн, плей-офф):
+    #             единица результата — МАТЧ из нескольких партий (Bo2/Bo4/Bo6
+    #             + армагеддон), а не партия. Обрабатывается отдельным циклом
+    #             bracket_monitoring_step в bot.py. Первый пример: EWC 2026.
     coverage_tier = str(raw.get("coverage_tier", "primary")).lower()
-    if coverage_tier not in ("primary", "secondary"):
+    if coverage_tier not in ("primary", "secondary", "bracket"):
         raise ValueError(
             f"[{tid}] coverage_tier = {coverage_tier!r}, ожидалось "
-            f"'primary' или 'secondary'"
+            f"'primary', 'secondary' или 'bracket'"
         )
 
     # Снявшиеся посреди турнира (травма/отказ). Фамилия из PGN, как ключи players.
@@ -230,6 +242,12 @@ def _normalize_profile(tid: str, raw: dict, defaults: dict) -> dict:
         "broadcast_id":         broadcast_id,
         "round_ids":            round_ids,
         "autodiscover_rounds":  autodiscover,
+        "group_probe_id":       group_probe_id,
+        "tour_name_exclude":    tour_name_exclude,
+        # Свободный текст про формат сетки — уходит Claude в промпт итогов
+        # этапа, чтобы он правильно говорил «проходит выше / падает в нижнюю
+        # сетку / вылетает», а не выдумывал таблицу очков.
+        "bracket_context":      str(raw.get("bracket_context") or ""),
         "algorithms":           algos,
         "params":               params,
         "players":              players,

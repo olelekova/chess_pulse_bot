@@ -112,6 +112,33 @@ python tournaments_config.py --active
 
 Локальные `params` у турнира перебивают `defaults`. Не указанные — берутся из `defaults`.
 
+| `upset_rating_gap` | 50 | bracket-турниры: победитель матча ниже соперника на ≥N Elo (из PGN) → пост-сенсация |
+
+---
+
+## Bracket-турниры (`coverage_tier: bracket`)
+
+Для матчевых/сеточных форматов (даблэлиминейшн, плей-офф) — первый пример
+**EWC 2026**. Единица результата — **матч** между парой (Bo2/Bo4/Bo6, при
+равном счёте армагеддон: нечётная партия, ничья = победа чёрных). Обрабатывает
+отдельный цикл `bracket_monitoring_step` в bot.py:
+
+- итоги каждого этапа сетки одним постом (`round_summary`) — по флагу
+  `finished` из Lichess API, без ROUND_SCHEDULE (расписание rolling);
+- `upset_analysis`: сенсация (разница Elo ≥ `upset_rating_gap`) → пост +
+  🔍 разбор переломного момента решающей партии;
+- места 1–4 после гранд-финала (`final_standings_with_places`) — гранд-финал
+  и матч за 3-е место ищутся по именам раундов;
+- партии с 0 ходов игнорируются (chess.com заводит армагеддон-доску заранее —
+  это НЕ walkover);
+- если `broadcast_id` пуст, tour ищется через группу бродкастов:
+  `lichess.group_probe_id` (id известного tour'а серии, напр. Play-in) +
+  `lichess.tour_name_exclude`;
+- `bracket_context` — свободный текст про формат, уходит Claude в промпт
+  итогов этапа.
+
+Тесты: `python test_bracket.py` и `python test_bracket_flow.py` (оффлайн).
+
 ---
 
 ## Тай-брейки

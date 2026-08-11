@@ -238,6 +238,7 @@ def _build_round_schedule(profile: dict) -> dict:
 
 _main_profile = None    # активный YAML-профиль для Open-слота (доступен ниже)
 _active_secondaries: list[tuple[str, dict]] = []   # secondary-турниры (Phase 2)
+_active_brackets: list[tuple[str, dict]] = []      # bracket-турниры (EWC и т.п.)
 try:
     _YAML_CFG = load_tournaments()
     _today_utc = datetime.datetime.now(_UTC).date()
@@ -259,6 +260,23 @@ try:
     if _active_secondaries:
         _names = [tid for tid, _ in _active_secondaries]
         print(f"[YAML] Secondary активны: {_names}")
+    # Bracket-турниры (матчевые/сеточные, напр. EWC) — свой цикл
+    # bracket_monitoring_step: единица результата — матч, а не партия.
+    _active_brackets = [
+        (tid, p) for tid, p in _active_yaml.items()
+        if p.get("coverage_tier") == "bracket"
+    ]
+    if _active_brackets:
+        _names = [tid for tid, _ in _active_brackets]
+        print(f"[YAML] Bracket активны: {_names}")
+        # Русские имена игроков bracket-турниров — в общий словарь.
+        # (Блок YAML OVERRIDE ниже делает это только для _main_profile,
+        # т.е. primary; без этого имена EWC остались бы латиницей.)
+        for _tid, _p in _active_brackets:
+            for _surname, _info in _p["players"].items():
+                PLAYER_NAMES_RU.setdefault(_surname, _info["ru"])
+                if _info.get("chess_com"):
+                    PLAYER_CHESS_COM.setdefault(_surname, _info["chess_com"])
     if _main_profile:
         print(f"[YAML] Активный турнир в Open-слоте: "
               f"{_main_profile['display_name']} ({_main_profile['id']})")
@@ -2713,6 +2731,439 @@ async def secondary_monitoring_step(bot: Bot, now: float) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# BRACKET TOURNAMENTS — матчевые/сеточные турниры (EWC 2026 и т.п.)
+# ═══════════════════════════════════════════════════════════════════════
+# Ключевое отличие от primary/secondary: единица результата — МАТЧ между
+# парой игроков (Bo2/Bo4/Bo6 + армагеддон при равном счёте), а не партия,
+# и вместо турнирной таблицы — состояние сетки.
+#
+# Поток (bracket_monitoring_step, каждый тик monitoring_loop):
+#   1. _bracket_resolve_broadcast_id — если broadcast_id пуст, ищем tour
+#      через ГРУППУ бродкастов Lichess (group_probe_id → .group.tours,
+#      минус tour_name_exclude). EWC main event публикуется в последний
+#      момент — бот подхватит его сам, без правки YAML.
+#   2. Тянем /api/broadcast/{id} → rounds[] c флагами finished/ongoing.
+#      Никакого ROUND_SCHEDULE: расписание rolling, стартов по часам нет.
+#   3. Для каждого finished-раунда (= этапа сетки), который ещё не обработан:
+#      группируем партии по парам игроков → матчи, считаем счёт (правило
+#      армагеддона: нечётная партия при равном счёте, ничья = победа чёрных),
+#      постим итоги этапа одним сообщением + сюжет от Claude.
+#   4. upset_analysis: если победитель матча ниже рейтингом соперника на
+#      ≥ params.upset_rating_gap (Elo из PGN-тегов) — отдельный пост-сенсация
+#      + 🔍 разбор переломного момента решающей партии с диаграммой.
+#   5. Когда ВСЕ раунды finished — финальный пост с местами 1–4
+#      (гранд-финал + матч за 3-е место ищутся по именам раундов).
+#
+# Ловушка формата, ради которой всё это: chess.com заводит армагеддон-доску
+# заранее; если она не понадобилась — остаётся партия с 0 ходов. Это НЕ
+# walkover и НЕ «тур не начался»: 0-ходовые партии просто игнорируются,
+# а готовность этапа определяется флагом finished из API, не PGN.
+
+bracket_broadcast_ids : dict[str, str]      = {}  # tid → найденный tour_id
+bracket_stage_done    : dict[str, set[str]] = {}  # tid → {round_id: итоги отправлены}
+bracket_upset_sent    : dict[str, set[str]] = {}  # tid → {match_key: сенсация отправлена}
+bracket_final_sent    : set[str]            = set()  # tid → пост с местами отправлен
+bracket_first_seen    : set[str]            = set()  # tid → стартовая амнистия сделана
+
+
+async def _bracket_resolve_broadcast_id(tid: str, profile: dict) -> str:
+    """Вернуть tour_id бродкаста. Если в YAML пусто — найти через группу.
+
+    Lichess объединяет связанные бродкасты в группу (.group.tours в JSON
+    любого tour'а серии). Берём group_probe_id (известный tour, напр.
+    Play-in), исключаем его самого и всё, что матчится на tour_name_exclude,
+    из остатка берём последний (самый новый). Результат кешируется."""
+    if profile.get("broadcast_id"):
+        return profile["broadcast_id"]
+    if tid in bracket_broadcast_ids:
+        return bracket_broadcast_ids[tid]
+    probe = profile.get("group_probe_id") or ""
+    if not probe:
+        return ""
+    excludes = [s.lower() for s in profile.get("tour_name_exclude", [])]
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            r = await client.get(
+                f"https://lichess.org/api/broadcast/{probe}",
+                headers={"User-Agent": "CandidatesBot/1.0", "Accept": "application/json"}
+            )
+            if r.status_code != 200:
+                print(f"[Bracket {tid}] group probe HTTP {r.status_code}")
+                return ""
+            tours = (r.json().get("group") or {}).get("tours", [])
+            candidates = [
+                t for t in tours
+                if t.get("id") and t["id"] != probe
+                and not any(ex in (t.get("name") or "").lower() for ex in excludes)
+            ]
+            if not candidates:
+                # Нормальная ситуация до публикации основного бродкаста —
+                # тихо ждём следующего тика.
+                return ""
+            chosen = candidates[-1]   # самый свежий в группе
+            bracket_broadcast_ids[tid] = chosen["id"]
+            print(f"[Bracket {tid}] найден бродкаст в группе: "
+                  f"{chosen['name']} ({chosen['id']})")
+            return chosen["id"]
+    except Exception as e:
+        print(f"[Bracket {tid}] resolve error: {e}")
+        return ""
+
+
+async def _bracket_fetch_rounds(broadcast_id: str) -> list[dict]:
+    """rounds[] бродкаста: [{id, name, startsAt, finished, ongoing}, ...]."""
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            r = await client.get(
+                f"https://lichess.org/api/broadcast/{broadcast_id}",
+                headers={"User-Agent": "CandidatesBot/1.0", "Accept": "application/json"}
+            )
+            if r.status_code != 200:
+                return []
+            out = []
+            for rd in r.json().get("rounds", []):
+                out.append({
+                    "id":       rd.get("id", ""),
+                    "name":     rd.get("name", ""),
+                    "startsAt": rd.get("startsAt"),
+                    "finished": bool(rd.get("finished")),
+                    "ongoing":  bool(rd.get("ongoing")),
+                })
+            return out
+    except Exception as e:
+        print(f"[Bracket] fetch rounds error: {e}")
+        return []
+
+
+def _pgn_elo(pgn_text: str, tag: str) -> int | None:
+    m = re.search(rf'\[{tag} "(\d+)"\]', pgn_text)
+    return int(m.group(1)) if m else None
+
+
+def _bracket_group_matches(pgns: list[str]) -> list[dict]:
+    """Сгруппировать партии раунда по парам игроков → список матчей.
+
+    Матч: {key, players: {ru: elo}, games: [{pgn, white, black, result,
+    moves}], score: {ru: float}, winner, loser, armageddon: bool}.
+
+    Правила счёта:
+      - партии с 0 ходов игнорируются (фантомные армагеддон-доски chess.com);
+      - если сыграно нечётное число партий и счёт ДО последней равный —
+        последняя считается армагеддоном: ничья = победа чёрных в матче
+        (по регламенту EWC у чёрных ничейный перевес после торгов);
+      - иначе победитель по сумме очков; при равенстве winner=None
+        (матч ещё не решён — не должно случаться на finished-раунде).
+    """
+    by_pair: dict[frozenset, list[dict]] = {}
+    for pgn in pgns:
+        n_moves = count_moves_pgn(pgn)
+        gd = pgn_to_game_data(pgn)
+        w, b = gd["white"]["username"], gd["black"]["username"]
+        res = gd.get("result", "*")
+        if n_moves == 0:
+            continue   # фантомная доска (армагеддон не понадобился) или не началась
+        game = {
+            "pgn": pgn, "white": w, "black": b, "result": res,
+            "moves": n_moves,
+            "white_elo": _pgn_elo(pgn, "WhiteElo"),
+            "black_elo": _pgn_elo(pgn, "BlackElo"),
+        }
+        by_pair.setdefault(frozenset((w, b)), []).append(game)
+
+    matches = []
+    for pair, games in by_pair.items():
+        if len(pair) < 2:
+            continue   # защита от битых PGN (игрок против самого себя?)
+        p1, p2 = sorted(pair)
+        score = {p1: 0.0, p2: 0.0}
+        elo: dict[str, int | None] = {p1: None, p2: None}
+        finished_games = [g for g in games if g["result"] in ("1-0", "0-1", "1/2-1/2")]
+        for g in finished_games:
+            if g["result"] == "1-0":
+                score[g["white"]] += 1.0
+            elif g["result"] == "0-1":
+                score[g["black"]] += 1.0
+            else:
+                score[g["white"]] += 0.5
+                score[g["black"]] += 0.5
+            if g["white_elo"]:
+                elo[g["white"]] = g["white_elo"]
+            if g["black_elo"]:
+                elo[g["black"]] = g["black_elo"]
+
+        winner = loser = None
+        armageddon = False
+        decisive_game = None
+        n = len(finished_games)
+        if n:
+            last = finished_games[-1]
+            pre_score = {p1: 0.0, p2: 0.0}
+            for g in finished_games[:-1]:
+                if g["result"] == "1-0":
+                    pre_score[g["white"]] += 1.0
+                elif g["result"] == "0-1":
+                    pre_score[g["black"]] += 1.0
+                else:
+                    pre_score[g["white"]] += 0.5
+                    pre_score[g["black"]] += 0.5
+            if n % 2 == 1 and pre_score[p1] == pre_score[p2]:
+                # Нечётная партия при равном счёте = армагеддон.
+                # Ничья в армагеддоне — победа чёрных.
+                armageddon = True
+                winner = last["white"] if last["result"] == "1-0" else last["black"]
+                decisive_game = last
+            elif score[p1] != score[p2]:
+                winner = p1 if score[p1] > score[p2] else p2
+                # Решающая партия для разбора: последняя результативная
+                # партия, выигранная победителем матча.
+                for g in reversed(finished_games):
+                    if ((g["result"] == "1-0" and g["white"] == winner)
+                            or (g["result"] == "0-1" and g["black"] == winner)):
+                        decisive_game = g
+                        break
+            if winner:
+                loser = p2 if winner == p1 else p1
+
+        matches.append({
+            "key":           f"{p1}__{p2}",
+            "p1": p1, "p2": p2,
+            "score":         score,
+            "elo":           elo,
+            "games":         finished_games,
+            "winner":        winner,
+            "loser":         loser,
+            "armageddon":    armageddon,
+            "decisive_game": decisive_game,
+        })
+    return matches
+
+
+def _fmt_score(x: float) -> str:
+    """2.0 → '2', 1.5 → '1½', 0.5 → '½'."""
+    if x == int(x):
+        return str(int(x))
+    return (str(int(x)) if x >= 1 else "") + "½"
+
+
+def _bracket_match_line(m: dict) -> str:
+    """Строка результата матча для поста итогов этапа."""
+    w, l = m["winner"], m["loser"]
+    if not w:
+        s = f"{_fmt_score(m['score'][m['p1']])}:{_fmt_score(m['score'][m['p2']])}"
+        return f"⚔️ {m['p1']} – {m['p2']} {s} (матч не решён)"
+    arm = ", арм." if m["armageddon"] else ""
+    s = f"{_fmt_score(m['score'][w])}:{_fmt_score(m['score'][l])}"
+    return f"⚔️ *{w}* – {l} {s}{arm}"
+
+
+async def _claude_bracket_storyline(profile: dict, stage_name: str,
+                                    match_lines_for_claude: list[str]) -> str:
+    """2–3 предложения от Claude про сюжет этапа сетки."""
+    if not ANTHROPIC_API_KEY:
+        return ""
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    ctx = profile.get("bracket_context", "")
+    user = f"""Завершился этап «{stage_name}» — {profile['display_name']}.
+
+Контекст формата турнира:
+{ctx}
+
+Результаты матчей этапа (победитель указан первым, «арм.» = армагеддон):
+{chr(10).join(match_lines_for_claude)}
+
+2–3 предложения о сюжете этапа. НЕ перечисляй матчи — они уже выше.
+Говори о последствиях для сетки (кто прошёл выше, кто упал в нижнюю
+сетку, кто вылетел) ТОЛЬКО если это однозначно следует из названия этапа
+и контекста формата; не выдумывай таблицу очков — здесь сетка, а не круговой
+турнир. Детали торгов за время в армагеддоне тебе неизвестны — не выдумывай.
+НЕ изобретай результатов и игроков, которых нет в данных.
+В конце поставь хэштег: {profile.get('hashtag', '#chess')}"""
+    try:
+        r = client.messages.create(
+            model="claude-sonnet-4-6", max_tokens=300,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user}]
+        )
+        return _trim_to_sentence(r.content[0].text)
+    except Exception as e:
+        print(f"[Bracket] storyline error: {e}")
+        return ""
+
+
+async def _bracket_send_stage_summary(bot: Bot, profile: dict,
+                                      stage_name: str, matches: list[dict]) -> None:
+    lines = [_bracket_match_line(m) for m in matches]
+    for_claude = []
+    for m in matches:
+        if m["winner"]:
+            arm = " (армагеддон)" if m["armageddon"] else ""
+            for_claude.append(
+                f"{m['winner']} победил {m['loser']} со счётом "
+                f"{_fmt_score(m['score'][m['winner']])}:{_fmt_score(m['score'][m['loser']])}{arm}"
+            )
+    storyline = await _claude_bracket_storyline(profile, stage_name, for_claude)
+    msg_parts = [f"{profile['emoji']} *{profile['display_name']} — {stage_name}: итоги*",
+                 "", *lines]
+    if storyline:
+        msg_parts.extend(["", storyline])
+    await send_update(bot, "\n".join(msg_parts))
+    print(f"[Bracket {profile.get('id', '?')}] {stage_name}: итоги отправлены")
+
+
+async def _bracket_send_upset(bot: Bot, profile: dict, stage_name: str,
+                              m: dict) -> None:
+    """Пост-сенсация + разбор переломного момента решающей партии."""
+    w, l = m["winner"], m["loser"]
+    ew, el = m["elo"].get(w), m["elo"].get(l)
+    elo_note = f" ({ew} против {el})" if ew and el else ""
+    arm = " в армагеддоне" if m["armageddon"] else ""
+    s = f"{_fmt_score(m['score'][w])}:{_fmt_score(m['score'][l])}"
+    msg = (f"😱 *Сенсация в {stage_name}!*\n"
+           f"*{w}* обыгрывает {l}{arm} — {s}{elo_note}\n"
+           f"_{profile['display_name']}_")
+    await send_update(bot, msg)
+    # Разбор решающей партии — существующий 🔍 пост с диаграммой.
+    g = m.get("decisive_game")
+    if g:
+        try:
+            await asyncio.sleep(2)
+            await send_game_analysis(bot, pgn_to_game_data(g["pgn"]), g["pgn"])
+        except Exception as e:
+            print(f"[Bracket] upset analysis error: {e}")
+
+
+def _bracket_is_upset(m: dict, gap: int) -> bool:
+    if not m["winner"]:
+        return False
+    ew = m["elo"].get(m["winner"])
+    el = m["elo"].get(m["loser"])
+    return bool(ew and el and (el - ew) >= gap)
+
+
+async def _bracket_send_final_places(bot: Bot, profile: dict,
+                                     rounds: list[dict]) -> bool:
+    """Места 1–4 после гранд-финала. Гранд-финал и матч за 3-е место ищем
+    по именам раундов. Гранд-финал EWC — best of 3 sets: если Lichess делает
+    раунд на каждый сет, чемпион = победитель ПОСЛЕДНЕГО сыгранного
+    финального раунда (решающий сет всегда берёт итоговый победитель).
+    Возвращает True, если пост отправлен."""
+    fin_re    = re.compile(r'финал|final', re.IGNORECASE)
+    semi_re   = re.compile(r'полу|semi', re.IGNORECASE)
+    bronze_re = re.compile(r'3.*мест|бронз|third|3rd', re.IGNORECASE)
+
+    finals = [r for r in rounds
+              if fin_re.search(r["name"]) and not semi_re.search(r["name"])
+              and not bronze_re.search(r["name"])]
+    bronzes = [r for r in rounds if bronze_re.search(r["name"])]
+    if not finals:
+        print("[Bracket] не нашёл раунд гранд-финала по имени — финальный пост пропущен")
+        return False
+
+    async def _round_winner(rd) -> tuple[str | None, str | None]:
+        pgns, _ = await get_round_pgns(rd["id"])
+        ms = _bracket_group_matches(pgns)
+        if len(ms) == 1 and ms[0]["winner"]:
+            return ms[0]["winner"], ms[0]["loser"]
+        return None, None
+
+    first = second = third = fourth = None
+    # Последний финальный раунд с решённым матчем (учёт сетов)
+    for rd in reversed(finals):
+        first, second = await _round_winner(rd)
+        if first:
+            break
+    if bronzes:
+        for rd in reversed(bronzes):
+            third, fourth = await _round_winner(rd)
+            if third:
+                break
+    if not first:
+        return False
+
+    lines = [f"🥇 *{first}*", f"🥈 {second}"]
+    if third:
+        lines.append(f"🥉 {third}")
+    if fourth:
+        lines.append(f"4. {fourth}")
+    msg = (f"{profile['emoji']} *{profile['display_name']} — итоги турнира*\n\n"
+           + "\n".join(lines)
+           + f"\n\n{profile.get('hashtag', '')}")
+    await send_update(bot, msg)
+    return True
+
+
+async def _process_bracket_tournament(bot: Bot, tid: str, profile: dict) -> None:
+    broadcast_id = await _bracket_resolve_broadcast_id(tid, profile)
+    if not broadcast_id:
+        return   # бродкаст ещё не опубликован — ждём
+
+    rounds = await _bracket_fetch_rounds(broadcast_id)
+    if not rounds:
+        return
+
+    done = bracket_stage_done.setdefault(tid, set())
+    upsets = bracket_upset_sent.setdefault(tid, set())
+
+    # Стартовая амнистия: раунды, завершённые ДО первого тика этого
+    # контейнера, не постим ретроактивно (аналог secondary_first_seen —
+    # защита от флуда после rolling-deploy Render посреди игрового дня).
+    if tid not in bracket_first_seen:
+        bracket_first_seen.add(tid)
+        pre = [r["id"] for r in rounds if r["finished"]]
+        done.update(pre)
+        if pre:
+            print(f"[Bracket {tid}] init: {len(pre)} прошедших этапов помечены обработанными")
+
+    algos = profile.get("algorithms", {})
+    gap = int(profile.get("params", {}).get("upset_rating_gap", 50))
+
+    for rd in rounds:
+        if not rd["finished"] or rd["id"] in done:
+            continue
+        pgns, dbg = await get_round_pgns(rd["id"])
+        print(f"[Bracket {tid}] {rd['name']} finished: {dbg}")
+        matches = _bracket_group_matches(pgns)
+        if not matches:
+            done.add(rd["id"])
+            continue
+        try:
+            if algos.get("round_summary", True):
+                await _bracket_send_stage_summary(bot, profile, rd["name"], matches)
+            if algos.get("upset_analysis", False):
+                for m in matches:
+                    if m["key"] in upsets or not _bracket_is_upset(m, gap):
+                        continue
+                    upsets.add(m["key"])
+                    await asyncio.sleep(2)
+                    await _bracket_send_upset(bot, profile, rd["name"], m)
+            done.add(rd["id"])   # ПОСЛЕ await — сетевой сбой не съедает пост
+        except Exception as e:
+            print(f"[Bracket {tid}] {rd['name']} FAILED — повторим на следующем тике: {e!r}")
+
+    # Финальный пост с местами — когда все раунды завершены
+    if (tid not in bracket_final_sent
+            and algos.get("final_standings_with_places", True)
+            and rounds and all(r["finished"] for r in rounds)
+            and all(r["id"] in done for r in rounds)):
+        try:
+            if await _bracket_send_final_places(bot, profile, rounds):
+                bracket_final_sent.add(tid)
+        except Exception as e:
+            print(f"[Bracket {tid}] final places error: {e}")
+
+
+async def bracket_monitoring_step(bot: Bot, now: float) -> None:
+    """Один шаг мониторинга всех активных bracket-турниров."""
+    if not _active_brackets:
+        return
+    for tid, profile in _active_brackets:
+        try:
+            await _process_bracket_tournament(bot, tid, profile)
+        except Exception as e:
+            print(f"[Bracket {tid}] step error: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 
 
 async def women_monitoring_step(bot: Bot, now: float):
@@ -2890,6 +3341,16 @@ async def monitoring_loop(bot: Bot):
 
             # ── Предварительный анонс тура (за ~30 мин до старта) ──
             await check_pre_round_announcement(bot)
+
+            # ── Bracket-турниры (EWC и т.п.) ────────────────────────
+            # ВАЖНО: ДО get_active_round_id — ниже стоит `continue` при
+            # отсутствии активного primary, и всё после него не выполняется.
+            # (У women/secondary шагов после `continue` та же проблема, но
+            # они живут только вместе с активным primary — исторически так.)
+            try:
+                await bracket_monitoring_step(bot, now)
+            except Exception as _be:
+                print(f"[Bracket] Step error: {_be}")
 
             round_id, round_name = await get_active_round_id()
 
@@ -3261,7 +3722,8 @@ async def main():
         open_descr = "нет активного primary"
     print(f"✅ Бот запущен. Open-слот: {open_descr}. "
           f"Women rounds: {len(WOMEN_KNOWN_ROUND_IDS)}. "
-          f"Secondary: {len(_active_secondaries)}.")
+          f"Secondary: {len(_active_secondaries)}. "
+          f"Bracket: {[tid for tid, _ in _active_brackets]}.")
     # monitoring_loop бесконечный
     await monitoring_loop(bot)
 
