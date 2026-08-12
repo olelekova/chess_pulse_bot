@@ -86,19 +86,19 @@ bot._claude_bracket_storyline = fake_storyline
 
 async def main():
     print("── Тик 1: стартовая амнистия (раунд A уже был завершён) ──")
-    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE)
+    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 0.0)
     check("ретро-постов нет", not sent, str(sent))
     check("раунд A помечен обработанным", "A" in bot.bracket_stage_done["ewc_2026"])
 
     print("── Тик 2: раунд B завершился, но сеть падает ──")
     ROUNDS[1]["finished"] = True
     fail_next_send.append(1)
-    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE)
+    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 0.0)
     check("пост не ушёл (сбой)", not sent)
     check("раунд B НЕ помечен — будет ретрай", "B" not in bot.bracket_stage_done["ewc_2026"])
 
     print("── Тик 3: ретрай успешен ──")
-    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE)
+    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 0.0)
     check("итоги этапа отправлены", any("Раунд 2: итоги" in m for m in sent), str(sent))
     check("сенсация отправлена", any("Сенсация" in m for m in sent))
     check("в сенсации Лазавик и армагеддон",
@@ -112,7 +112,7 @@ async def main():
 
     print("── Тик 4: идемпотентность (ничего нового) ──")
     n = len(sent)
-    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE)
+    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 0.0)
     check("дублей нет", len(sent) == n)
 
 asyncio.run(main())

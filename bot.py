@@ -2759,27 +2759,34 @@ async def secondary_monitoring_step(bot: Bot, now: float) -> None:
 # walkover и НЕ «тур не начался»: 0-ходовые партии просто игнорируются,
 # а готовность этапа определяется флагом finished из API, не PGN.
 
-bracket_broadcast_ids : dict[str, str]      = {}  # tid → найденный tour_id
+bracket_tours_cache   : dict[str, tuple[float, list]] = {}  # tid → (ts, [(tour_id, name)])
 bracket_stage_done    : dict[str, set[str]] = {}  # tid → {round_id: итоги отправлены}
-bracket_upset_sent    : dict[str, set[str]] = {}  # tid → {match_key: сенсация отправлена}
+bracket_upset_sent    : dict[str, set[str]] = {}  # tid → {round_id:match_key: сенсация отправлена}
 bracket_final_sent    : set[str]            = set()  # tid → пост с местами отправлен
-bracket_first_seen    : set[str]            = set()  # tid → стартовая амнистия сделана
+bracket_seen_tours    : set[str]            = set()  # tour_id → стартовая амнистия сделана
+
+# Пере-опрос группы бродкастов: новые tour'ы (напр. Playoffs) появляются
+# посреди турнира, кеш нельзя держать вечно.
+BRACKET_TOURS_TTL = 1800   # 30 мин
 
 
-async def _bracket_resolve_broadcast_id(tid: str, profile: dict) -> str:
-    """Вернуть tour_id бродкаста. Если в YAML пусто — найти через группу.
+async def _bracket_resolve_tours(tid: str, profile: dict, now: float) -> list[tuple[str, str]]:
+    """Вернуть СПИСОК [(tour_id, tour_name)] бродкастов турнира.
 
-    Lichess объединяет связанные бродкасты в группу (.group.tours в JSON
-    любого tour'а серии). Берём group_probe_id (известный tour, напр.
-    Play-in), исключаем его самого и всё, что матчится на tour_name_exclude,
-    из остатка берём последний (самый новый). Результат кешируется."""
+    Один турнир может состоять из нескольких tour'ов Lichess: EWC 2026 —
+    это «Group Stage | A» + «Group Stage | B» (+ Playoffs позже). Если в
+    YAML задан broadcast_id — берём только его. Иначе ищем через группу
+    (.group.tours в JSON group_probe_id), исключая сам probe и всё, что
+    матчится на tour_name_exclude. Кеш с TTL: новые tour'ы (плей-офф)
+    подхватываются по ходу турнира."""
     if profile.get("broadcast_id"):
-        return profile["broadcast_id"]
-    if tid in bracket_broadcast_ids:
-        return bracket_broadcast_ids[tid]
+        return [(profile["broadcast_id"], "")]
     probe = profile.get("group_probe_id") or ""
     if not probe:
-        return ""
+        return []
+    cached = bracket_tours_cache.get(tid)
+    if cached and now - cached[0] < BRACKET_TOURS_TTL:
+        return cached[1]
     excludes = [s.lower() for s in profile.get("tour_name_exclude", [])]
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
@@ -2789,25 +2796,23 @@ async def _bracket_resolve_broadcast_id(tid: str, profile: dict) -> str:
             )
             if r.status_code != 200:
                 print(f"[Bracket {tid}] group probe HTTP {r.status_code}")
-                return ""
+                return cached[1] if cached else []
             tours = (r.json().get("group") or {}).get("tours", [])
             candidates = [
-                t for t in tours
+                (t["id"], t.get("name") or "")
+                for t in tours
                 if t.get("id") and t["id"] != probe
                 and not any(ex in (t.get("name") or "").lower() for ex in excludes)
             ]
-            if not candidates:
-                # Нормальная ситуация до публикации основного бродкаста —
-                # тихо ждём следующего тика.
-                return ""
-            chosen = candidates[-1]   # самый свежий в группе
-            bracket_broadcast_ids[tid] = chosen["id"]
-            print(f"[Bracket {tid}] найден бродкаст в группе: "
-                  f"{chosen['name']} ({chosen['id']})")
-            return chosen["id"]
+            old = {c[0] for c in (cached[1] if cached else [])}
+            for cid, cname in candidates:
+                if cid not in old:
+                    print(f"[Bracket {tid}] найден бродкаст в группе: {cname} ({cid})")
+            bracket_tours_cache[tid] = (now, candidates)
+            return candidates
     except Exception as e:
         print(f"[Bracket {tid}] resolve error: {e}")
-        return ""
+        return cached[1] if cached else []
 
 
 async def _bracket_fetch_rounds(broadcast_id: str) -> list[dict]:
@@ -3092,61 +3097,81 @@ async def _bracket_send_final_places(bot: Bot, profile: dict,
     return True
 
 
-async def _process_bracket_tournament(bot: Bot, tid: str, profile: dict) -> None:
-    broadcast_id = await _bracket_resolve_broadcast_id(tid, profile)
-    if not broadcast_id:
-        return   # бродкаст ещё не опубликован — ждём
+_GROUP_TOUR_RE = re.compile(r'group|групп', re.IGNORECASE)
 
-    rounds = await _bracket_fetch_rounds(broadcast_id)
-    if not rounds:
-        return
+
+async def _process_bracket_tournament(bot: Bot, tid: str, profile: dict,
+                                      now: float) -> None:
+    tours = await _bracket_resolve_tours(tid, profile, now)
+    if not tours:
+        return   # бродкаст ещё не опубликован — ждём
 
     done = bracket_stage_done.setdefault(tid, set())
     upsets = bracket_upset_sent.setdefault(tid, set())
-
-    # Стартовая амнистия: раунды, завершённые ДО первого тика этого
-    # контейнера, не постим ретроактивно (аналог secondary_first_seen —
-    # защита от флуда после rolling-deploy Render посреди игрового дня).
-    if tid not in bracket_first_seen:
-        bracket_first_seen.add(tid)
-        pre = [r["id"] for r in rounds if r["finished"]]
-        done.update(pre)
-        if pre:
-            print(f"[Bracket {tid}] init: {len(pre)} прошедших этапов помечены обработанными")
-
     algos = profile.get("algorithms", {})
     gap = int(profile.get("params", {}).get("upset_rating_gap", 50))
 
-    for rd in rounds:
-        if not rd["finished"] or rd["id"] in done:
+    all_rounds: list[tuple[dict, str]] = []   # (round, tour_name)
+    for tour_id, tour_name in tours:
+        rounds = await _bracket_fetch_rounds(tour_id)
+        if not rounds:
             continue
-        pgns, dbg = await get_round_pgns(rd["id"])
-        print(f"[Bracket {tid}] {rd['name']} finished: {dbg}")
-        matches = _bracket_group_matches(pgns)
-        if not matches:
-            done.add(rd["id"])
-            continue
-        try:
-            if algos.get("round_summary", True):
-                await _bracket_send_stage_summary(bot, profile, rd["name"], matches)
-            if algos.get("upset_analysis", False):
-                for m in matches:
-                    if m["key"] in upsets or not _bracket_is_upset(m, gap):
-                        continue
-                    upsets.add(m["key"])
-                    await asyncio.sleep(2)
-                    await _bracket_send_upset(bot, profile, rd["name"], m)
-            done.add(rd["id"])   # ПОСЛЕ await — сетевой сбой не съедает пост
-        except Exception as e:
-            print(f"[Bracket {tid}] {rd['name']} FAILED — повторим на следующем тике: {e!r}")
 
-    # Финальный пост с местами — когда все раунды завершены
+        # Стартовая амнистия ПО TOUR'У: раунды, завершённые до первого
+        # обнаружения этого tour'а, не постим ретроактивно (защита от
+        # флуда после rolling-deploy Render посреди игрового дня).
+        if tour_id not in bracket_seen_tours:
+            bracket_seen_tours.add(tour_id)
+            pre = [r["id"] for r in rounds if r["finished"]]
+            done.update(pre)
+            if pre:
+                print(f"[Bracket {tid}] init {tour_name or tour_id}: "
+                      f"{len(pre)} прошедших этапов помечены обработанными")
+
+        all_rounds.extend((rd, tour_name) for rd in rounds)
+
+        for rd in rounds:
+            if not rd["finished"] or rd["id"] in done:
+                continue
+            # Метка этапа: имя tour'а (напр. «Group Stage | A»), если их
+            # несколько — иначе раунды «Upper | Раунд 1» из групп A и B
+            # неотличимы в постах.
+            stage_label = f"{tour_name} · {rd['name']}" if tour_name and len(tours) > 1 else rd["name"]
+            pgns, dbg = await get_round_pgns(rd["id"])
+            print(f"[Bracket {tid}] {stage_label} finished: {dbg}")
+            matches = _bracket_group_matches(pgns)
+            if not matches:
+                done.add(rd["id"])
+                continue
+            try:
+                if algos.get("round_summary", True):
+                    await _bracket_send_stage_summary(bot, profile, stage_label, matches)
+                if algos.get("upset_analysis", False):
+                    for m in matches:
+                        ukey = f"{rd['id']}:{m['key']}"
+                        if ukey in upsets or not _bracket_is_upset(m, gap):
+                            continue
+                        upsets.add(ukey)
+                        await asyncio.sleep(2)
+                        await _bracket_send_upset(bot, profile, stage_label, m)
+                done.add(rd["id"])   # ПОСЛЕ await — сетевой сбой не съедает пост
+            except Exception as e:
+                print(f"[Bracket {tid}] {stage_label} FAILED — повторим на следующем тике: {e!r}")
+
+    # Финальный пост с местами — когда все раунды всех tour'ов завершены.
+    # Гранд-финал/бронзу ищем ТОЛЬКО среди не-групповых tour'ов (Playoffs):
+    # внутри групповых сеток есть свои раунды «Финалы» (Upper/Lower Финалы),
+    # которые нельзя принять за гранд-финал турнира. Пока tour плей-офф не
+    # опубликован — playoff_rounds пуст и пост не отправляется.
+    playoff_rounds = [rd for rd, tname in all_rounds
+                      if not _GROUP_TOUR_RE.search(tname)]
     if (tid not in bracket_final_sent
             and algos.get("final_standings_with_places", True)
-            and rounds and all(r["finished"] for r in rounds)
-            and all(r["id"] in done for r in rounds)):
+            and playoff_rounds
+            and all_rounds and all(rd["finished"] for rd, _ in all_rounds)
+            and all(rd["id"] in done for rd, _ in all_rounds)):
         try:
-            if await _bracket_send_final_places(bot, profile, rounds):
+            if await _bracket_send_final_places(bot, profile, playoff_rounds):
                 bracket_final_sent.add(tid)
         except Exception as e:
             print(f"[Bracket {tid}] final places error: {e}")
@@ -3158,7 +3183,7 @@ async def bracket_monitoring_step(bot: Bot, now: float) -> None:
         return
     for tid, profile in _active_brackets:
         try:
-            await _process_bracket_tournament(bot, tid, profile)
+            await _process_bracket_tournament(bot, tid, profile, now)
         except Exception as e:
             print(f"[Bracket {tid}] step error: {e}")
 

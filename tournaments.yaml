@@ -703,6 +703,7 @@ tournaments:
       Caruana:           { ru: "Каруана",      chess_com: "fabiano-caruana" }
       Nepomniachtchi:    { ru: "Непомнящий" }
       Erigaisi:          { ru: "Эригайси" }
+      Arjun:             { ru: "Эригайси" }   # в бродкастах EWC он «Arjun»
       Nihal:             { ru: "Нихал Сарин" }
       Pranesh:           { ru: "Пранеш" }
       Niemann:           { ru: "Ниманн" }
