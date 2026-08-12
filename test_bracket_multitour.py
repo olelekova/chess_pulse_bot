@@ -90,6 +90,8 @@ async def main():
 
     print("── Групповой день: обе группы завершили по этапу ──")
     await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 0.0)
+    check("сразу постов нет — гейт стабилизации", len(sent) == 0, str(len(sent)))
+    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 700.0)
     check("3 поста итогов (A: 2 этапа, B: 1)", len(sent) == 3, str(len(sent)))
     check("метка группы A в посте", any("Group Stage | A · Upper | Раунд 1" in m for m in sent))
     check("метка группы B в посте", any("Group Stage | B · Upper | Раунд 1" in m for m in sent))
@@ -103,7 +105,7 @@ async def main():
         {"id": "pf", "name": "Гранд-финал", "finished": False, "ongoing": False},
     ]
     sent.clear()
-    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 0.0)
+    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 1400.0)
     check("плей-офф идёт — финального поста ещё нет",
           not any("итоги турнира" in m for m in sent))
 
@@ -111,7 +113,8 @@ async def main():
     for r in ROUNDS["PO"]:
         r["finished"] = True
     sent.clear()
-    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 0.0)
+    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 2100.0)   # fp store
+    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 2800.0)   # post
     final = [m for m in sent if "итоги турнира" in m]
     check("финальный пост отправлен", len(final) == 1, str(sent))
     if final:

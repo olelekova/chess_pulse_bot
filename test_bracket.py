@@ -105,6 +105,13 @@ m = ms[0]
 check("победителя пока нет", m["winner"] is None)
 check("строка матча — «не решён»", "не решён" in bot._bracket_match_line(m))
 
+print("── 4b. Одна завершённая партия ≠ решённый матч (вторая ещё не в трансляции) ──")
+pgns = [mk_pgn("Lazavik, Denis", "Movahed, Sina", "1-0", welo="2620", belo="2600")]
+ms = bot._bracket_group_matches(pgns)
+m = ms[0]
+check("победителя нет при единственной партии", m["winner"] is None, str(m["winner"]))
+check("и это не армагеддон", not m["armageddon"])
+
 print("── 5. Раунд с 4 матчами (2 доски × 2 партии на пару) ──")
 pgns = []
 pairs = [("Grischuk, Alexander", "Aravindh, Chithambaram VR."),

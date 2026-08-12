@@ -2769,6 +2769,28 @@ bracket_seen_tours    : set[str]            = set()  # tour_id → старто�
 # посреди турнира, кеш нельзя держать вечно.
 BRACKET_TOURS_TTL = 1800   # 30 мин
 
+# Окно стабилизации раунда перед постом итогов. Флаг finished у Lichess
+# ТРАНЗИЕНТНЫЙ: он означает «все уже созданные партии доиграны», а chess.com
+# добавляет партии в трансляцию с задержкой (вторая партия матча, армагеддон,
+# а то и целые матчи — 12 авг у группы B раунд стал finished, когда Карлсен
+# ещё не начал играть). Поэтому итоги этапа шлём только когда состав партий
+# раунда не менялся минимум это время И все матчи решены.
+BRACKET_CONFIRM_SECONDS = 600   # 10 мин ≈ 2 тика
+bracket_round_fp : dict[str, tuple] = {}   # round_id → (fingerprint, since_ts)
+
+
+def _bracket_round_fingerprint(pgns: list[str]) -> tuple:
+    """Слепок состава раунда: (White|Black|Result|полуходы) по каждой партии.
+    Меняется при появлении новой партии, нового результата или новых ходов."""
+    items = []
+    for p in pgns:
+        w = re.search(r'\[White "([^"]+)"\]', p)
+        b = re.search(r'\[Black "([^"]+)"\]', p)
+        res = re.search(r'\[Result "([^"]+)"\]', p)
+        items.append(f'{w.group(1) if w else "?"}|{b.group(1) if b else "?"}'
+                     f'|{res.group(1) if res else "*"}|{count_moves_pgn(p)}')
+    return tuple(sorted(items))
+
 
 async def _bracket_resolve_tours(tid: str, profile: dict, now: float) -> list[tuple[str, str]]:
     """Вернуть СПИСОК [(tour_id, tour_name)] бродкастов турнира.
@@ -2900,7 +2922,10 @@ def _bracket_group_matches(pgns: list[str]) -> list[dict]:
         armageddon = False
         decisive_game = None
         n = len(finished_games)
-        if n:
+        # n >= 2: матч в этом формате — минимум две партии. Одна завершённая
+        # партия = матч ещё идёт (вторая просто не появилась в трансляции),
+        # победителя объявлять рано (12 авг «Лазавик 1:0, арм.» — как раз это).
+        if n >= 2:
             last = finished_games[-1]
             pre_score = {p1: 0.0, p2: 0.0}
             for g in finished_games[:-1]:
@@ -2911,7 +2936,7 @@ def _bracket_group_matches(pgns: list[str]) -> list[dict]:
                 else:
                     pre_score[g["white"]] += 0.5
                     pre_score[g["black"]] += 0.5
-            if n % 2 == 1 and pre_score[p1] == pre_score[p2]:
+            if n % 2 == 1 and n >= 3 and pre_score[p1] == pre_score[p2]:
                 # Нечётная партия при равном счёте = армагеддон.
                 # Ничья в армагеддоне — победа чёрных.
                 armageddon = True
@@ -3139,9 +3164,29 @@ async def _process_bracket_tournament(bot: Bot, tid: str, profile: dict,
             stage_label = f"{tour_name} · {rd['name']}" if tour_name and len(tours) > 1 else rd["name"]
             pgns, dbg = await get_round_pgns(rd["id"])
             print(f"[Bracket {tid}] {stage_label} finished: {dbg}")
+
+            # ── Гейт стабилизации ────────────────────────────────────
+            # finished у Lichess транзиентен (см. BRACKET_CONFIRM_SECONDS):
+            # ждём, пока состав партий не меняется >= окна, И все матчи
+            # решены. Иначе на следующем тике проверим снова.
+            fp = _bracket_round_fingerprint(pgns)
+            prev = bracket_round_fp.get(rd["id"])
+            if prev is None or prev[0] != fp:
+                bracket_round_fp[rd["id"]] = (fp, now)
+                print(f"[Bracket {tid}] {stage_label}: состав партий обновился — "
+                      f"жду стабилизации ({BRACKET_CONFIRM_SECONDS}с)")
+                continue
+            if now - prev[1] < BRACKET_CONFIRM_SECONDS:
+                continue
+
             matches = _bracket_group_matches(pgns)
             if not matches:
                 done.add(rd["id"])
+                continue
+            if not all(m["winner"] for m in matches):
+                undecided = [m["key"] for m in matches if not m["winner"]]
+                print(f"[Bracket {tid}] {stage_label}: finished, но матчи не решены "
+                      f"({undecided}) — транзиентный флаг, жду")
                 continue
             try:
                 if algos.get("round_summary", True):

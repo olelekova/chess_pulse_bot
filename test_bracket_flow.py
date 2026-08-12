@@ -85,20 +85,25 @@ bot.send_game_analysis = fake_send_game_analysis
 bot._claude_bracket_storyline = fake_storyline
 
 async def main():
-    print("── Тик 1: стартовая амнистия (раунд A уже был завершён) ──")
+    print("── Тик 1 (t=0): стартовая амнистия (раунд A уже был завершён) ──")
     await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 0.0)
     check("ретро-постов нет", not sent, str(sent))
     check("раунд A помечен обработанным", "A" in bot.bracket_stage_done["ewc_2026"])
 
-    print("── Тик 2: раунд B завершился, но сеть падает ──")
+    print("── Тик 2 (t=1000): раунд B завершился — гейт стабилизации, поста ещё нет ──")
     ROUNDS[1]["finished"] = True
+    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 1000.0)
+    check("пост не ушёл (ждём стабилизации состава)", not sent, str(sent))
+    check("раунд B не помечен", "B" not in bot.bracket_stage_done["ewc_2026"])
+
+    print("── Тик 3 (t=1700): состав стабилен, но сеть падает ──")
     fail_next_send.append(1)
-    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 0.0)
+    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 1700.0)
     check("пост не ушёл (сбой)", not sent)
     check("раунд B НЕ помечен — будет ретрай", "B" not in bot.bracket_stage_done["ewc_2026"])
 
-    print("── Тик 3: ретрай успешен ──")
-    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 0.0)
+    print("── Тик 4 (t=2400): ретрай успешен ──")
+    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 2400.0)
     check("итоги этапа отправлены", any("Раунд 2: итоги" in m for m in sent), str(sent))
     check("сенсация отправлена", any("Сенсация" in m for m in sent))
     check("в сенсации Лазавик и армагеддон",
@@ -110,9 +115,9 @@ async def main():
     # Ничейный армагеддон: очки 1½:1½, победитель выделен + пометка «арм.»
     check("счёт матча в посте", "1½:1½" in summary and "арм." in summary, summary)
 
-    print("── Тик 4: идемпотентность (ничего нового) ──")
+    print("── Тик 5 (t=3100): идемпотентность (ничего нового) ──")
     n = len(sent)
-    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 0.0)
+    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 3100.0)
     check("дублей нет", len(sent) == n)
 
 asyncio.run(main())
