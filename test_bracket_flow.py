@@ -44,7 +44,7 @@ PROFILE = {
     "broadcast_id": "MAINEVENT", "group_probe_id": "", "tour_name_exclude": [],
     "bracket_context": "тестовый контекст",
     "algorithms": {"round_summary": True, "upset_analysis": True,
-                   "final_standings_with_places": True},
+                   "final_standings_with_places": True, "preview": True},
     "params": {"upset_rating_gap": 50},
 }
 
@@ -52,6 +52,7 @@ PROFILE = {
 ROUNDS = [
     {"id": "A", "name": "Группа A | Раунд 1", "startsAt": 1, "finished": True, "ongoing": False},
     {"id": "B", "name": "Группа A | Раунд 2", "startsAt": 2, "finished": False, "ongoing": True},
+    {"id": "C", "name": "Группа A | Раунд 3", "startsAt": 3, "finished": False, "ongoing": False},
 ]
 PGNS = {
     "A": [mk_pgn("Carlsen, Magnus", "Bok, Benjamin", "1-0", welo="2839", belo="2600"),
@@ -102,7 +103,9 @@ async def main():
     check("пост не ушёл (сбой)", not sent)
     check("раунд B НЕ помечен — будет ретрай", "B" not in bot.bracket_stage_done["ewc_2026"])
 
-    print("── Тик 4 (t=2400): ретрай успешен ──")
+    print("── Тик 4 (t=2400): ретрай успешен, пары раунда 3 уже известны ──")
+    PGNS["C"] = [mk_pgn("Carlsen, Magnus", "Lazavik, Denis", "*", moves=""),
+                 mk_pgn("Nakamura, Hikaru", "Bok, Benjamin", "*", moves="")]
     await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 2400.0)
     check("итоги этапа отправлены", any("Раунд 2: итоги" in m for m in sent), str(sent))
     check("сенсация отправлена", any("Сенсация" in m for m in sent))
@@ -114,10 +117,25 @@ async def main():
     check("сюжет в посте", "Сюжет этапа" in summary)
     # Ничейный армагеддон: очки 1½:1½, победитель выделен + пометка «арм.»
     check("счёт матча в посте", "1½:1½" in summary and "арм." in summary, summary)
+    check("блок «Дальше» с парами раунда 3 в итогах",
+          "⏭" in summary and "Раунд 3" in summary and "Карлсен — Лазавик" in summary,
+          summary)
+    check("отдельного анонса пар раунда 3 нет (уже в итогах)",
+          not any("Раунд 3: пары" in m for m in sent))
 
-    print("── Тик 5 (t=3100): идемпотентность (ничего нового) ──")
+    print("── Тик 5 (t=3100): пары нового этапа появились позже — отдельный анонс ──")
+    ROUNDS.append({"id": "D", "name": "Группа A | Lower | Раунд 1",
+                   "startsAt": 4, "finished": False, "ongoing": False})
+    PGNS["D"] = [mk_pgn("Duda, Jan-Krzysztof", "Movahed, Sina", "*", moves="")]
     n = len(sent)
     await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 3100.0)
+    ann = [m for m in sent[n:] if "Lower | Раунд 1: пары" in m]
+    check("отдельный анонс пар отправлен", len(ann) == 1, str(sent[n:]))
+    check("пара в анонсе", ann and "Дуда — Мовахед" in ann[0], ann[0] if ann else "")
+
+    print("── Тик 6 (t=3800): идемпотентность (ничего нового) ──")
+    n = len(sent)
+    await bot._process_bracket_tournament(None, "ewc_2026", PROFILE, 3800.0)
     check("дублей нет", len(sent) == n)
 
 asyncio.run(main())

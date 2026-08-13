@@ -2777,6 +2777,8 @@ BRACKET_TOURS_TTL = 1800   # 30 мин
 # раунда не менялся минимум это время И все матчи решены.
 BRACKET_CONFIRM_SECONDS = 600   # 10 мин ≈ 2 тика
 bracket_round_fp : dict[str, tuple] = {}   # round_id → (fingerprint, since_ts)
+bracket_pairs_announced : set[str] = set()  # round_id → пары этапа уже показаны
+                                            # (в блоке «Дальше» итогов или отдельным анонсом)
 
 
 def _bracket_round_fingerprint(pgns: list[str]) -> tuple:
@@ -2986,6 +2988,61 @@ def _bracket_match_line(m: dict) -> str:
     return f"⚔️ *{w}* – {l} {s}{arm}"
 
 
+def _bracket_round_pairs(pgns: list[str]) -> list[tuple[str, str]]:
+    """Уникальные пары раунда (в порядке досок), включая партии без ходов —
+    chess.com создаёт партии следующего этапа с парами заранее."""
+    pairs, seen = [], set()
+    for pgn in pgns:
+        gd = pgn_to_game_data(pgn)
+        w, b = gd["white"]["username"], gd["black"]["username"]
+        if not w or not b or w in ("White",) or b in ("Black",):
+            continue
+        key = frozenset((w, b))
+        if len(key) < 2 or key in seen:
+            continue
+        seen.add(key)
+        pairs.append((w, b))
+    return pairs
+
+
+def _bracket_start_line(profile: dict, starts_at) -> str:
+    """'🕐 15:40 Париж / 16:40 Москва' из startsAt (мс). Пусто, если нет данных."""
+    if not starts_at:
+        return ""
+    try:
+        dt = datetime.datetime.fromtimestamp(starts_at / 1000, tz=_UTC)
+        msk = dt.astimezone(ZoneInfo("Europe/Moscow")).strftime("%H:%M")
+        tz_name = profile.get("local_tz") or "Europe/Paris"
+        city = profile.get("local_city") or "по месту игры"
+        local = dt.astimezone(ZoneInfo(tz_name)).strftime("%H:%M")
+        return f"🕐 {local} {city} / {msk} Москва"
+    except Exception:
+        return ""
+
+
+async def _bracket_next_pairs_lines(profile: dict, tour_rounds: list[dict],
+                                    stage_label_of) -> tuple[list[str], list[str]]:
+    """Блок «Дальше»: пары ещё не стартовавших раундов tour'а, которые ещё
+    не анонсировались. Возвращает (строки для поста, round_ids для пометки)."""
+    lines, rids = [], []
+    upcoming = [r for r in tour_rounds
+                if not r["finished"] and r["id"] not in bracket_pairs_announced]
+    upcoming.sort(key=lambda r: r.get("startsAt") or 0)
+    for rd in upcoming[:2]:   # не дальше двух ближайших этапов
+        pgns, _ = await get_round_pgns(rd["id"])
+        if any(count_moves_pgn(p) > 0 for p in pgns):
+            continue   # этап уже играется — это не «анонс», пропускаем
+        pairs = _bracket_round_pairs(pgns)
+        if not pairs:
+            continue
+        start = _bracket_start_line(profile, rd.get("startsAt"))
+        header = f"⏭ *{stage_label_of(rd)}*" + (f" — {start}" if start else "")
+        lines.append(header)
+        lines.extend(f"• {w} — {b}" for w, b in pairs)
+        rids.append(rd["id"])
+    return lines, rids
+
+
 async def _claude_bracket_storyline(profile: dict, stage_name: str,
                                     match_lines_for_claude: list[str]) -> str:
     """2–3 предложения от Claude про сюжет этапа сетки."""
@@ -3021,7 +3078,8 @@ async def _claude_bracket_storyline(profile: dict, stage_name: str,
 
 
 async def _bracket_send_stage_summary(bot: Bot, profile: dict,
-                                      stage_name: str, matches: list[dict]) -> None:
+                                      stage_name: str, matches: list[dict],
+                                      next_lines: list[str] | None = None) -> None:
     lines = [_bracket_match_line(m) for m in matches]
     for_claude = []
     for m in matches:
@@ -3036,6 +3094,8 @@ async def _bracket_send_stage_summary(bot: Bot, profile: dict,
                  "", *lines]
     if storyline:
         msg_parts.extend(["", storyline])
+    if next_lines:
+        msg_parts.extend(["", *next_lines])
     await send_update(bot, "\n".join(msg_parts))
     print(f"[Bracket {profile.get('id', '?')}] {stage_name}: итоги отправлены")
 
@@ -3189,8 +3249,19 @@ async def _process_bracket_tournament(bot: Bot, tid: str, profile: dict,
                       f"({undecided}) — транзиентный флаг, жду")
                 continue
             try:
+                # Блок «Дальше»: пары следующих этапов сетки, если chess.com
+                # уже создал партии (обычно создаёт заранее).
+                next_lines: list[str] = []
+                next_rids: list[str] = []
+                if algos.get("preview", False):
+                    _label = (lambda r: f"{tour_name} · {r['name']}"
+                              if tour_name and len(tours) > 1 else r["name"])
+                    next_lines, next_rids = await _bracket_next_pairs_lines(
+                        profile, rounds, _label)
                 if algos.get("round_summary", True):
-                    await _bracket_send_stage_summary(bot, profile, stage_label, matches)
+                    await _bracket_send_stage_summary(bot, profile, stage_label,
+                                                      matches, next_lines)
+                    bracket_pairs_announced.update(next_rids)
                 if algos.get("upset_analysis", False):
                     for m in matches:
                         ukey = f"{rd['id']}:{m['key']}"
@@ -3202,6 +3273,40 @@ async def _process_bracket_tournament(bot: Bot, tid: str, profile: dict,
                 done.add(rd["id"])   # ПОСЛЕ await — сетевой сбой не съедает пост
             except Exception as e:
                 print(f"[Bracket {tid}] {stage_label} FAILED — повторим на следующем тике: {e!r}")
+
+        # ── Отдельный анонс пар этапа ──────────────────────────────
+        # Если пары появились ПОСЛЕ итогов предыдущего этапа (не попали в
+        # блок «Дальше») — анонсируем коротким постом, пока этап не начался.
+        if algos.get("preview", False):
+            for rd in rounds:
+                if rd["finished"] or rd["id"] in bracket_pairs_announced:
+                    continue
+                pgns, _ = await get_round_pgns(rd["id"])
+                if not pgns:
+                    continue
+                if any(count_moves_pgn(p) > 0 for p in pgns):
+                    # Этап уже играется — анонсировать поздно (и не надо
+                    # ретроспективно после рестарта). Просто помечаем.
+                    bracket_pairs_announced.add(rd["id"])
+                    continue
+                pairs = _bracket_round_pairs(pgns)
+                if not pairs:
+                    continue
+                stage_label = (f"{tour_name} · {rd['name']}"
+                               if tour_name and len(tours) > 1 else rd["name"])
+                start = _bracket_start_line(profile, rd.get("startsAt"))
+                msg_parts = [f"{profile['emoji']} *{profile['display_name']} — "
+                             f"{stage_label}: пары*"]
+                if start:
+                    msg_parts.append(start)
+                msg_parts.append("")
+                msg_parts.extend(f"• {w} — {b}" for w, b in pairs)
+                try:
+                    await send_update(bot, "\n".join(msg_parts))
+                    bracket_pairs_announced.add(rd["id"])
+                    print(f"[Bracket {tid}] {stage_label}: анонс пар отправлен")
+                except Exception as e:
+                    print(f"[Bracket {tid}] {stage_label} анонс пар FAILED: {e!r}")
 
     # Финальный пост с местами — когда все раунды всех tour'ов завершены.
     # Гранд-финал/бронзу ищем ТОЛЬКО среди не-групповых tour'ов (Playoffs):

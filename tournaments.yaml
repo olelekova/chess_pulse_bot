@@ -678,7 +678,9 @@ tournaments:
       победитель получает $250,000. Не выдумывай таблицу очков — здесь сетка.
 
     algorithms:
-      preview:                     false
+      preview:                     true    # для bracket = пары следующего этапа:
+                                           # блок «⏭» в итогах или отдельный анонс,
+                                           # когда chess.com создаёт партии
       new_game:                    false
       pulse:                       false
       eval_swing:                  false
