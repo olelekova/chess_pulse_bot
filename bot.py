@@ -3043,18 +3043,35 @@ async def _bracket_next_pairs_lines(profile: dict, tour_rounds: list[dict],
     return lines, rids
 
 
+def _bracket_player_facts(profile: dict, participants_ru: set[str]) -> str:
+    """Справка «Имя — страна» для участников этапа из YAML-профиля.
+    Единственный разрешённый источник биографии для Claude."""
+    facts = []
+    seen = set()
+    for info in profile.get("players", {}).values():
+        ru = info.get("ru", "")
+        country = info.get("country", "")
+        if ru and country and ru in participants_ru and ru not in seen:
+            seen.add(ru)
+            facts.append(f"{ru} — {country}")
+    return "; ".join(facts)
+
+
 async def _claude_bracket_storyline(profile: dict, stage_name: str,
-                                    match_lines_for_claude: list[str]) -> str:
+                                    match_lines_for_claude: list[str],
+                                    participants_ru: set[str] | None = None) -> str:
     """2–3 предложения от Claude про сюжет этапа сетки."""
     if not ANTHROPIC_API_KEY:
         return ""
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
     ctx = profile.get("bracket_context", "")
+    facts = _bracket_player_facts(profile, participants_ru or set())
+    facts_block = (f"\nСправка об игроках (страны): {facts}\n" if facts else "")
     user = f"""Завершился этап «{stage_name}» — {profile['display_name']}.
 
 Контекст формата турнира:
 {ctx}
-
+{facts_block}
 Результаты матчей этапа (победитель указан первым, «арм.» = армагеддон):
 {chr(10).join(match_lines_for_claude)}
 
@@ -3064,6 +3081,9 @@ async def _claude_bracket_storyline(profile: dict, stage_name: str,
 и контекста формата; не выдумывай таблицу очков — здесь сетка, а не круговой
 турнир. Детали торгов за время в армагеддоне тебе неизвестны — не выдумывай.
 НЕ изобретай результатов и игроков, которых нет в данных.
+ЗАПРЕЩЕНО приписывать игрокам национальность, возраст, титулы и любые
+биографические факты, которых нет в справке выше. Нет справки — не упоминай
+национальность вообще.
 В конце поставь хэштег: {profile.get('hashtag', '#chess')}"""
     try:
         r = client.messages.create(
@@ -3089,7 +3109,9 @@ async def _bracket_send_stage_summary(bot: Bot, profile: dict,
                 f"{m['winner']} победил {m['loser']} со счётом "
                 f"{_fmt_score(m['score'][m['winner']])}:{_fmt_score(m['score'][m['loser']])}{arm}"
             )
-    storyline = await _claude_bracket_storyline(profile, stage_name, for_claude)
+    participants = {p for m in matches for p in (m["p1"], m["p2"])}
+    storyline = await _claude_bracket_storyline(profile, stage_name, for_claude,
+                                                participants)
     msg_parts = [f"{profile['emoji']} *{profile['display_name']} — {stage_name}: итоги*",
                  "", *lines]
     if storyline:

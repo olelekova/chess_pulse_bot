@@ -74,7 +74,7 @@ async def fake_get_round_pgns(rid):
     return PGNS.get(rid, []), f"stub {rid}"
 async def fake_send_update(b, msg):
     sent.append(msg)
-async def fake_storyline(profile, stage, lines):
+async def fake_storyline(profile, stage, lines, *args, **kw):
     return "Сюжет."
 
 bot._bracket_resolve_tours = fake_resolve

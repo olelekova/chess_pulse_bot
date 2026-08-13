@@ -76,7 +76,7 @@ async def fake_send_update(b, msg):
     sent.append(msg)
 async def fake_send_game_analysis(b, gd, pgn):
     analyzed.append(gd)
-async def fake_storyline(profile, stage, lines):
+async def fake_storyline(profile, stage, lines, *args, **kw):
     return "Сюжет этапа. #ewc2026"
 
 bot._bracket_fetch_rounds = fake_fetch_rounds

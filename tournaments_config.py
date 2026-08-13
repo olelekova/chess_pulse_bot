@@ -204,7 +204,8 @@ def _normalize_profile(tid: str, raw: dict, defaults: dict) -> dict:
     players = {}
     for surname, info in (raw.get("players") or {}).items():
         if isinstance(info, str):
-            players[surname] = {"ru": info, "chess_com": "", "gender": "m"}
+            players[surname] = {"ru": info, "chess_com": "", "gender": "m",
+                                "country": ""}
         elif isinstance(info, dict):
             g = str(info.get("gender", "m")).lower()
             if g not in ("m", "f"):
@@ -215,6 +216,11 @@ def _normalize_profile(tid: str, raw: dict, defaults: dict) -> dict:
                 "ru":        info.get("ru", surname),
                 "chess_com": info.get("chess_com", ""),
                 "gender":    g,
+                # Страна по-русски («Польша») — единственный источник
+                # биографических фактов для Claude в постах. Если пусто,
+                # Claude запрещено упоминать национальность вовсе (12 авг
+                # он назвал Дуду «бразильцем»).
+                "country":   str(info.get("country", "")),
             }
         else:
             raise ValueError(f"[{tid}] players[{surname}] неверного типа: {type(info)}")

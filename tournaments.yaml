@@ -698,34 +698,36 @@ tournaments:
 
     # Фамилия из PGN → русское имя. Сюда включены и 14 сеяных, и все
     # участники Play-in (лишние не мешают — маппинг срабатывает по PGN).
+    # country — единственный источник биографических фактов для Claude
+    # в сюжетах постов (иначе выдумывает: 12 авг назвал Дуду «бразильцем»).
     players:
-      Carlsen:           { ru: "Карлсен",      chess_com: "magnuscarlsen" }
-      Nakamura:          { ru: "Накамура",     chess_com: "hikaru" }
-      Firouzja:          { ru: "Фирузджа",     chess_com: "firouzja2003" }
-      Caruana:           { ru: "Каруана",      chess_com: "fabiano-caruana" }
-      Nepomniachtchi:    { ru: "Непомнящий" }
-      Erigaisi:          { ru: "Эригайси" }
-      Arjun:             { ru: "Эригайси" }   # в бродкастах EWC он «Arjun»
-      Nihal:             { ru: "Нихал Сарин" }
-      Pranesh:           { ru: "Пранеш" }
-      Niemann:           { ru: "Ниманн" }
-      So:                { ru: "Уэсли Со",     chess_com: "gmwso" }
-      "Vachier-Lagrave": { ru: "МВЛ",          chess_com: "lyonbeast" }
-      Duda:              { ru: "Дуда" }
-      Sarana:            { ru: "Сарана" }
-      Abdusattorov:      { ru: "Абдусатторов" }
-      Movahed:           { ru: "Мовахед" }
-      Lazavik:           { ru: "Лазавик" }
-      Bok:               { ru: "Бок" }
+      Carlsen:           { ru: "Карлсен",      chess_com: "magnuscarlsen", country: "Норвегия" }
+      Nakamura:          { ru: "Накамура",     chess_com: "hikaru", country: "США" }
+      Firouzja:          { ru: "Фирузджа",     chess_com: "firouzja2003", country: "Франция" }
+      Caruana:           { ru: "Каруана",      chess_com: "fabiano-caruana", country: "США" }
+      Nepomniachtchi:    { ru: "Непомнящий",   country: "Россия" }
+      Erigaisi:          { ru: "Эригайси",     country: "Индия" }
+      Arjun:             { ru: "Эригайси",     country: "Индия" }   # в бродкастах EWC он «Arjun»
+      Nihal:             { ru: "Нихал Сарин",  country: "Индия" }
+      Pranesh:           { ru: "Пранеш",       country: "Индия" }
+      Niemann:           { ru: "Ниманн",       country: "США" }
+      So:                { ru: "Уэсли Со",     chess_com: "gmwso", country: "США" }
+      "Vachier-Lagrave": { ru: "МВЛ",          chess_com: "lyonbeast", country: "Франция" }
+      Duda:              { ru: "Дуда",         country: "Польша" }
+      Sarana:            { ru: "Сарана",       country: "Сербия" }
+      Abdusattorov:      { ru: "Абдусатторов", country: "Узбекистан" }
+      Movahed:           { ru: "Мовахед",      country: "Иран" }
+      Lazavik:           { ru: "Лазавик",      country: "Беларусь" }
+      Bok:               { ru: "Бок",          country: "Нидерланды" }
       # Участники Play-in (двое из них выйдут в основную сетку)
-      Artemiev:          { ru: "Артемьев" }
-      Maghsoodloo:       { ru: "Магсудлу" }
-      Wei:               { ru: "Вэй И",        chess_com: "wei-yi-cn" }
-      Bortnyk:           { ru: "Бортник" }
-      Grischuk:          { ru: "Грищук" }
-      Aravindh:          { ru: "Аравинд" }
-      Le:                { ru: "Ле Куанг Льем" }
-      Esipenko:          { ru: "Есипенко",     chess_com: "esipenko" }
+      Artemiev:          { ru: "Артемьев",     country: "Россия" }
+      Maghsoodloo:       { ru: "Магсудлу",     country: "Иран" }
+      Wei:               { ru: "Вэй И",        chess_com: "wei-yi-cn", country: "Китай" }
+      Bortnyk:           { ru: "Бортник",      country: "Украина" }
+      Grischuk:          { ru: "Грищук",       country: "Россия" }
+      Aravindh:          { ru: "Аравинд",      country: "Индия" }
+      Le:                { ru: "Ле Куанг Льем", country: "Вьетнам" }
+      Esipenko:          { ru: "Есипенко",     country: "Россия" }
 
 
   # ─── ШАБЛОН для нового турнира ───────────────────────────────────────
