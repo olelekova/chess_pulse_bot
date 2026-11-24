@@ -730,6 +730,82 @@ tournaments:
       Esipenko:          { ru: "Есипенко",     country: "Россия" }
 
 
+  # ─── Матч за звание чемпиона мира 2026 ───────────────────────────────
+  # Женева, Fondation Martin Bodmer (Cologny), 22 ноября — 13 декабря 2026.
+  # Классика до 7½ очков из 14 партий; при 7-7 — тай-брейк (рапид, затем
+  # армагеддон). Контроль: 120'/40 + 30'/рест + 30"/ход c хода 41.
+  # Старт каждой партии 15:00 CET = 14:00 UTC = 17:00 МСК.
+  # Дни отдыха: 27 ноября, 1 декабря, 5 декабря, 9 декабря (3 партии → rest).
+  #
+  # Формат — матч между 2 игроками, 1 партия на «тур». Поэтому:
+  #   - round_summary оставлен вкл: даёт пост с итогом партии + текущим
+  #     счётом матча + разбором переломного момента с диаграммой.
+  #   - game_over_post ВЫКЛ, чтобы не дублировать round_summary (иначе
+  #     два поста подряд на одно и то же событие).
+  #   - new_game, pulse, eval_swing, opening_15min — важны: в матче ЧМ
+  #     каждая партия отдельное событие, выбор дебюта — сюжет.
+  #   - final_standings_with_places сработает только на 14-й партии; если
+  #     матч закончится досрочно (7½ до 14 партий) — финальный пост не
+  #     выйдет автоматически, сделать руками.
+  wcc_2026:
+    active:         true
+    display_name:   "Матч за звание чемпиона мира 2026"
+    short_name:     "ЧМ 2026"
+    hashtag:        "#чм2026"
+    emoji:          "👑"
+    qualifies_for:  ""
+    local_tz:       "Europe/Zurich"
+    local_city:     "Женева"
+    start_date:     "2026-11-24"
+    end_date:       "2026-12-11"
+    total_rounds:   14
+    rest_days:      ["2026-11-27", "2026-12-01", "2026-12-05", "2026-12-09"]
+
+    lichess:
+      broadcast_id: "qfkdt8mn"
+      round_ids:
+        - ["xLgOJ6cb", "Game 1"]
+        - ["L3j03TZq", "Game 2"]
+        - ["fnmEB1kH", "Game 3"]
+        - ["wIwJtPqz", "Game 4"]
+        - ["ueVpeXxW", "Game 5"]
+        - ["b0ACq4LF", "Game 6"]
+        - ["OZYNuhhF", "Game 7"]
+        - ["K9grUNXr", "Game 8"]
+        - ["gBI5kKDi", "Game 9"]
+        - ["NhfhTSep", "Game 10"]
+        - ["bAU22Apj", "Game 11"]
+        - ["vRbnvNEi", "Game 12"]
+        - ["S4C6oJ1k", "Game 13"]
+        - ["MDkKXuQD", "Game 14"]
+      autodiscover_rounds: true
+
+    algorithms:
+      preview:                     true
+      new_game:                    true
+      pulse:                       true
+      eval_swing:                  true
+      opening_15min:               true
+      turning_point:               true
+      round_summary:               true    # для 1 партии = пост-итог + счёт матча
+      game_over_post:              false   # перекрывается round_summary (1 партия)
+      final_standings_with_places: true    # сработает на Game 14 (если матч дошёл)
+      hourly_recap:                false
+
+    params:
+      round_start_utc:     "14:00"         # 15:00 Женева CET / 17:00 МСК
+      pulse_intervals:     [3600, 7200, 10800]  # 1ч / 2ч / 3ч — матч, не круговой
+      eval_swing_threshold: 1.2
+      novelty_move_threshold: 15
+      # Тай-брейки за 1 место в матче нерелевантны (при 7-7 будет рапид-плей-офф
+      # на следующий день — отдельный пост руками). Для корректности оставим
+      # дефолтный список: при равенстве очков формально FIDE предусмотрен плей-офф.
+
+    players:
+      Gukesh:    { ru: "Гукеш",    chess_com: "gukeshdommaraju", country: "Индия" }
+      Sindarov:  { ru: "Синдаров", chess_com: "sindarov",         country: "Узбекистан" }
+
+
   # ─── ШАБЛОН для нового турнира ───────────────────────────────────────
   # Скопируй этот блок, переименуй (например new_super_tournament_2026)
   # и заполни поля. Удалять _template не нужно — бот игнорирует имена с "_".
