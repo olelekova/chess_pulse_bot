@@ -1525,6 +1525,8 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
         )
 
     # Таблица очков для контекста
+    points: dict[str, float] = {}
+    rounds_played = 0
     try:
         points, rounds_played = await calculate_standings()
         sorted_pts = sorted(points.items(), key=lambda x: -x[1])
@@ -1540,11 +1542,33 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
     _female = []
     _display = "турнира претендентов 2026"
     _hashtag = "#турнир_претендентов"
+    # Формат матча (2 игрока, 1 партия на «тур») — например, матч за звание
+    # чемпиона мира. В этом режиме round_summary отказывается от «турнирной
+    # таблицы» и «турнирной интриги»: вместо них — счёт матча и число
+    # партий до конца.
+    _is_match = False
+    _match_score = ""
+    _total_rounds = 0
     if _main_profile:
         _female = [info["ru"] for info in _main_profile["players"].values()
                    if info.get("gender") == "f"]
         _display = _main_profile["display_name"] or _display
         _hashtag = _main_profile["hashtag"] or _hashtag
+        _total_rounds = int(_main_profile.get("total_rounds", 0) or 0)
+        if len(_main_profile.get("players", {})) == 2:
+            _is_match = True
+            # Счёт матча в фиксированном порядке игроков профиля
+            # («Гукеш 1 — Синдаров 0»), с текущим числом сыгранных партий.
+            _ru_names = [info["ru"] for info in _main_profile["players"].values()]
+            if len(_ru_names) == 2 and points:
+                a, b = _ru_names
+                pa = points.get(a, 0.0)
+                pb = points.get(b, 0.0)
+                def _f(x: float) -> str:
+                    return str(int(x)) if x == int(x) else str(x)
+                tail = (f" (после {rounds_played} из {_total_rounds} партий)"
+                        if _total_rounds else "")
+                _match_score = f"{a} {_f(pa)} — {b} {_f(pb)}{tail}"
     system, user = build_prompt("round_summary",
         round_name=round_name,
         results_for_claude=results_for_claude,
@@ -1553,6 +1577,9 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
         female_players=_female,
         tournament_display=_display,
         hashtag=_hashtag,
+        is_match=_is_match,
+        match_score=_match_score,
+        total_rounds=_total_rounds,
     )
 
     r = client.messages.create(
