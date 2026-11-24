@@ -133,6 +133,14 @@ PLAYER_CHESS_COM = {
 # round_summary ожиданием «когда же она начнётся».
 WITHDRAWN_PLAYERS: set[str] = set()
 
+# Минимальное число загруженных PGN для триггера round_summary.
+# Для round-robin (8 игроков = 4 партии в туре) >= 2 защищает от гонки:
+# «одна партия приехала, остальные ещё качаются». Для матча (2 игрока =
+# 1 партия в туре) этот порог блокирует round_summary навсегда — ЧМ 2026
+# Гукеш/Синдаров именно так молчал после Game 1. Перезаписывается из
+# YAML по числу игроков в активном профиле.
+MIN_GAMES_FOR_ROUND_SUMMARY = 2
+
 # ═══ ЖЕНСКИЙ ТУРНИР ПРЕТЕНДЕНТОВ 2026 ═════════════════════════
 # Облегчённый мониторинг: превью тура → пульс 1ч → пульс 2ч → итоги
 WOMEN_BROADCAST_ID = "xj4qM8Nw"   # ID серии (не раунда!)
@@ -294,6 +302,8 @@ try:
         # Используется в is_walkover_game(): партия с 0 ходов, где один из
         # игроков снят, считается walkover'ом и не блокирует round_summary.
         WITHDRAWN_PLAYERS = set(_main_profile.get("withdrawn", []))
+        # Матч (2 игрока) = 1 партия в туре → round_summary ждёт >= 1 PGN.
+        MIN_GAMES_FOR_ROUND_SUMMARY = 1 if len(_main_profile["players"]) == 2 else 2
         # Профиль алгоритмов
         TOURNAMENT_PROFILES["open"].update({
             **_main_profile["algorithms"],
@@ -3541,7 +3551,7 @@ async def women_monitoring_step(bot: Bot, now: float):
         # аналогичный фикс в монtorinroом цикле open-турнира выше).
         if (games_pgn
                 and round_id not in w_round_summary_done
-                and len(games_pgn) >= 2
+                and len(games_pgn) >= MIN_GAMES_FOR_ROUND_SUMMARY
                 and all(pgn_is_finished[p] for p in games_pgn)):
             try:
                 await send_women_round_summary(bot, round_name, games_pgn)
@@ -3760,7 +3770,7 @@ async def monitoring_loop(bot: Bot):
             # 7 мая 2026 пропали итоги Round 7 + финальный пост с местами.
             if (games_pgn
                     and round_id not in round_summary_done
-                    and len(games_pgn) >= 2
+                    and len(games_pgn) >= MIN_GAMES_FOR_ROUND_SUMMARY
                     and all(pgn_is_resolved[p] for p in games_pgn)):  # walkover тоже = «закрыто»
                 try:
                     await send_round_summary(bot, round_name, games_pgn)
