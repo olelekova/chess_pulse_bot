@@ -524,6 +524,14 @@ def pgn_game_id(pgn_text: str) -> str:
     black_m = re.search(r'\[Black "([^"]+)"\]', pgn_text)
     w = white_m.group(1) if white_m else "?"
     b = black_m.group(1) if black_m else "?"
+    # В матче одна и та же пара с теми же цветами играет через партию
+    # (Game 1, 3, 5…). Без тега Round их id совпадали бы: бот считал бы
+    # Game 3 «уже начатой/законченной» (нет new_game, пульсов, дебюта), а
+    # кэш переломных моментов отдавал бы моменты из Game 1.
+    round_m = re.search(r'\[Round "([^"]+)"\]', pgn_text)
+    rnd = round_m.group(1).strip() if round_m else ""
+    if rnd and rnd not in ("?", "-"):
+        return f"{w}_vs_{b}#{rnd}"
     return f"{w}_vs_{b}"
 
 
@@ -779,6 +787,40 @@ def _build_tp_dict(causing_idx: int, evals: list, san_list: list,
 _tp_cache: dict[str, list[dict]] = {}
 
 
+def _score_to_eval(sc) -> float:
+    """chess.engine.Score (с точки зрения белых) → число в пешках."""
+    if sc.is_mate():
+        mate_in = sc.mate()
+        # Далёкий мат = большое преимущество, не 99.0
+        # (иначе свинги между "мат в 15" и "+3" выглядят огромными)
+        if abs(mate_in) <= 5:
+            return 99.0 if mate_in > 0 else -99.0
+        return 10.0 if mate_in > 0 else -10.0
+    return sc.score() / 100.0
+
+
+def _evals_from_broadcast(game, n_moves: int) -> list | None:
+    """Оценки из комментариев [%eval] трансляции Lichess (глубокий анализ).
+
+    Формат как у Stockfish-ветки ниже: evals[i] = оценка ПЕРЕД ходом i,
+    первые 10 полуходов — None. Возвращает None, если оценок в PGN нет или
+    их мало (<90% ходов) — тогда считаем своим движком.
+
+    Зачем: свой анализ на depth=10 шумит. В Game 1 ЧМ-2026 он «нашёл»
+    перелом ≥1.5 пешки на 21. g4 в ничейном берлинском эндшпиле, где
+    трансляция показывала +0.30 → 0.00, — и бот выпустил разбор и итоги,
+    построенные на несуществующей ошибке.
+    """
+    after = []
+    for node in game.mainline():
+        pov = node.eval()
+        after.append(_score_to_eval(pov.white()) if pov is not None else None)
+    tail = after[9:]
+    if not tail or sum(e is not None for e in tail) < 0.9 * len(tail):
+        return None
+    return [None] * 10 + [after[i - 1] for i in range(10, n_moves)]
+
+
 def find_turning_points(pgn_text: str) -> list[dict]:
     """Найти два переломных момента партии:
     1) Ход, больше всего сдвинувший оценку В ПОЛЬЗУ белых (delta > 0)
@@ -805,28 +847,20 @@ def find_turning_points(pgn_text: str) -> list[dict]:
             san_list.append(temp.san(m))
             temp.push(m)
 
-        # Stockfish: depth=10, пропускаем первые 10 полуходов
-        evals = []
-        with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
-            b = game.board()
-            for i, move in enumerate(moves):
-                if i < 10:
-                    evals.append(None)  # placeholder — не анализируем
-                else:
-                    info = engine.analyse(b, chess.engine.Limit(depth=10))
-                    sc = info["score"].white()
-                    if sc.is_mate():
-                        mate_in = sc.mate()
-                        # Далёкий мат = большое преимущество, не 99.0
-                        # (иначе свинги между "мат в 15" и "+3" выглядят огромными)
-                        if abs(mate_in) <= 5:
-                            ev = 99.0 if mate_in > 0 else -99.0
-                        else:
-                            ev = 10.0 if mate_in > 0 else -10.0
+        # Сначала — оценки самой трансляции; свой Stockfish (depth=10,
+        # пропускаем первые 10 полуходов) только если их в PGN нет.
+        evals = _evals_from_broadcast(game, len(moves))
+        if evals is None:
+            evals = []
+            with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
+                b = game.board()
+                for i, move in enumerate(moves):
+                    if i < 10:
+                        evals.append(None)  # placeholder — не анализируем
                     else:
-                        ev = sc.score() / 100.0
-                    evals.append(ev)
-                b.push(move)
+                        info = engine.analyse(b, chess.engine.Limit(depth=10))
+                        evals.append(_score_to_eval(info["score"].white()))
+                    b.push(move)
 
         # Найти два переломных момента: лучший для белых и лучший для чёрных
         # delta = evals[i] - evals[i-1], положительная = в пользу белых
@@ -1026,6 +1060,50 @@ def count_moves_pgn(pgn_text: str) -> int:
     return int(nums[-1]) * 2 if nums else 0
 
 
+def full_moves(plies: int) -> int:
+    """Полуходы → номер полного хода (как пишут люди: «38 ходов», «ход 21»).
+    Внутри бота move_count/count_moves_pgn остаются в ПОЛУХОДАХ — на них
+    завязаны пороги (кулдауны, «партия началась»). Для текстов постов и
+    промптов всегда пропускать через эту функцию: Game 1 ЧМ-2026 длилась
+    38 ходов, а бот писал «76 ходов» и «долгий 76-ходовый эндшпиль»."""
+    return (plies + 1) // 2
+
+
+def round_title_ru(round_name: str) -> str:
+    """«Game 3» → «Партия 3» (матчевые трансляции Lichess называют туры
+    Game N). Остальные названия не трогаем."""
+    m = re.fullmatch(r"Game (\d+)", round_name.strip())
+    return f"Партия {m.group(1)}" if m else round_name
+
+
+def game_ending_san(pgn_text: str, plies: int = 14) -> str:
+    """Последние ходы партии с номерами: «32. Bxh6+ Kg8 33. Rg5+ Kh7 …».
+    Нужны round_summary, чтобы Claude видел, ЧЕМ кончилась партия (жертва,
+    вечный шах, матовая атака), а не додумывал концовку."""
+    try:
+        game = chess.pgn.read_game(io.StringIO(pgn_text))
+        if not game:
+            return ""
+        moves = list(game.mainline_moves())
+        board = game.board()
+        start = max(0, len(moves) - plies)
+        parts = []
+        for i, m in enumerate(moves):
+            if i >= start:
+                san = board.san(m)
+                if board.turn == chess.WHITE:
+                    parts.append(f"{board.fullmove_number}. {san}")
+                elif i == start:
+                    parts.append(f"{board.fullmove_number}... {san}")
+                else:
+                    parts.append(san)
+            board.push(m)
+        return " ".join(parts)
+    except Exception as e:
+        print(f"game_ending_san error: {e}")
+        return ""
+
+
 # ─── STOCKFISH ────────────────────────────────────────────────
 def evaluate_position(pgn_text: str) -> dict | None:
     try:
@@ -1179,7 +1257,7 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
 
         system, user = build_prompt(event_type,
             white=white, black=black,
-            move_count=eval_data['move_count'],
+            move_count=full_moves(eval_data['move_count']),
             best_move=eval_data['best_move'],
             moves_san=eval_data.get('moves_san', []),
             fen=eval_data.get("fen", ""),
@@ -1196,7 +1274,7 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
     else:
         system, user = build_prompt(event_type,
             white=white, black=black,
-            move_count=eval_data['move_count'],
+            move_count=full_moves(eval_data['move_count']),
             best_move=eval_data['best_move'],
             moves_san=eval_data.get('moves_san', []),
             fen=eval_data.get("fen", ""),
@@ -1417,14 +1495,28 @@ def get_draw_reason(pgn_text: str) -> str | None:
         if game is None:
             return None
         board = game.board()
+        checks = []   # (цвет ходившего, дал ли шах) по каждому полуходу
         for move in game.mainline_moves():
+            mover = board.turn
             board.push(move)
+            checks.append((mover, board.is_check()))
     except Exception as e:
         print(f"get_draw_reason error: {e}")
         return None
 
     if board.is_repetition(3) or board.can_claim_threefold_repetition():
         gd = pgn_to_game_data(pgn_text)
+        # Вечный шах: в последних 8 полуходах шахует только одна сторона,
+        # минимум дважды (Game 1 ЧМ-2026: 33. Rg5+ / 35. Rg5+ / 37. Rg5+).
+        tail = checks[-8:]
+        w_checks = sum(1 for c, chk in tail if chk and c == chess.WHITE)
+        b_checks = sum(1 for c, chk in tail if chk and c == chess.BLACK)
+        if w_checks >= 2 and b_checks == 0:
+            return (f"троекратное повторение позиции (вечный шах со стороны "
+                    f"белых — {gd['white']['username']})")
+        if b_checks >= 2 and w_checks == 0:
+            return (f"троекратное повторение позиции (вечный шах со стороны "
+                    f"чёрных — {gd['black']['username']})")
         side = "white" if board.turn == chess.WHITE else "black"
         return f"троекратное повторение позиции (инициатор — {gd[side]['username']})"
     if board.is_stalemate():
@@ -1497,7 +1589,7 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
         w, b = gd["white"]["username"], gd["black"]["username"]
         res = get_game_result(pgn)
         info = extract_opening_info(pgn)
-        n_moves = count_moves_pgn(pgn)
+        n_moves = full_moves(count_moves_pgn(pgn))
         n_moves_str = str(n_moves) if n_moves else "?"
         opening = info.get("opening") or info.get("eco") or "неизвестно"
         first_moves = " ".join(info.get("first_moves", [])[:6])
@@ -1587,7 +1679,13 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
         results_for_claude.append(
             f"• {w} (белые) vs {b} (чёрные): {res}, {n_moves_str} ходов. "
             + (f"Причина ничьей: {draw_reason}. " if draw_reason else "")
+            + ("(Повторение позиции не «предлагают» — пиши «ничья повторением "
+               "ходов» или «вечный шах».) "
+               if draw_reason and "повторение" in draw_reason else "")
             + f"Дебют: {opening}. Первые ходы: {first_moves}.{tp_info}"
+            + (f" Концовка партии (последние ходы): {game_ending_san(pgn)}. "
+               f"Опиши, чем закончилась партия, по этим ходам — не выдумывай."
+               if game_ending_san(pgn) else "")
         )
 
     # Таблица очков для контекста
@@ -1636,7 +1734,7 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
                         if _total_rounds else "")
                 _match_score = f"{a} {_f(pa)} — {b} {_f(pb)}{tail}"
     system, user = build_prompt("round_summary",
-        round_name=round_name,
+        round_name=round_title_ru(round_name),
         results_for_claude=results_for_claude,
         standings_text=standings_text,
         is_women=False,
@@ -1658,8 +1756,9 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
     analysis = re.sub(r'^#+\s+', '', analysis, flags=re.MULTILINE)
 
     results_block = "\n".join(results_lines)
-    msg = (f"🏁 *{round_name} — итоги*\n\n"
-           f"{results_block}\n\n"
+    score_line = f"\n📊 Счёт матча: {_match_score}" if _is_match and _match_score else ""
+    msg = (f"🏁 *{round_title_ru(round_name)} — итоги*\n\n"
+           f"{results_block}{score_line}\n\n"
            f"{analysis}")
     await send_update(bot, msg)
     # Автоматически показать таблицу очков после итогов тура.
@@ -1670,7 +1769,9 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
         TOURNAMENT_PROFILES["open"], round_name, KNOWN_ROUND_IDS,
         OPEN_PLAYERS_RU,
     )
-    if not sent_final:
+    # В матче таблица из двух строк дублирует счёт, который уже стоит в
+    # итогах, — отдельным постом её не шлём.
+    if not sent_final and not _is_match:
         await send_standings(bot, TELEGRAM_CHAT_ID)
 
     # 🔍 Разбор лучшей партии тура — отдельным постом с диаграммой.
@@ -1775,7 +1876,8 @@ async def send_round_start(bot: Bot, round_name: str, games_pgn: list[str]):
             items.append(f"{name} {pts_s}")
         if items:
             standings_block = (
-                f"📊 *Положение перед {round_name}:* "
+                f"📊 *Положение перед "
+                f"{round_title_ru(round_name).replace('Партия ', 'партией ')}:* "
                 f"{', '.join(items)}\n\n"
             )
 
@@ -1788,7 +1890,7 @@ async def send_round_start(bot: Bot, round_name: str, games_pgn: list[str]):
     title_emoji = _open_profile.get("emoji", "🏆")
     title_name  = _open_profile.get("display_name", "Турнир претендентов")
 
-    msg = (f"{title_emoji} *{title_name} — {round_name}*\n"
+    msg = (f"{title_emoji} *{title_name} — {round_title_ru(round_name)}*\n"
            f"_{today}_"
            f"{time_line}\n"
            f"{standings_block}"
@@ -1866,7 +1968,7 @@ async def send_pulse_update(bot: Bot, game_data: dict, pgn: str, label: str,
 
     system, user = build_prompt("pulse",
         white=white, black=black, label=label,
-        move_count=eval_data['move_count'],
+        move_count=full_moves(eval_data['move_count']),
         eval_str=eval_data['eval_str'],
         moves_san=eval_data.get('moves_san', []),
         fen=fen,
@@ -1882,7 +1984,7 @@ async def send_pulse_update(bot: Bot, game_data: dict, pgn: str, label: str,
     commentary = _trim_to_sentence(r.content[0].text)
 
     msg = (f"{tag} *{white} — {black}* | {label}\n"
-           f"Ход {eval_data['move_count']} | Оценка: `{eval_data['eval_str']}`\n"
+           f"Ход {full_moves(eval_data['move_count'])} | Оценка: `{eval_data['eval_str']}`\n"
            f"⏱ {white}: `{wr}` | {black}: `{br}`\n\n"
            f"{commentary}")
     await send_update_with_photo(bot, msg, pgn)
@@ -1948,7 +2050,7 @@ def format_event_msg(game_data: dict, eval_data: dict, event_type: str,
                 result_line += f" — {draw_reason}"
 
     return (f"{icons.get(event_type,'♟️')} *{w} — {b}*{result_line}\n"
-            f"Ход {eval_data['move_count']} | Оценка: `{eval_data['eval_str']}` | "
+            f"Ход {full_moves(eval_data['move_count'])} | Оценка: `{eval_data['eval_str']}` | "
             f"Лучший: `{eval_data['best_move']}`"
             f"{clock_line}\n\n"
             f"🧠 {commentary}")
@@ -2423,7 +2525,7 @@ async def send_women_round_summary(bot: Bot, round_name: str, games_pgn: list[st
         w, b = gd["white"]["username"], gd["black"]["username"]
         res = get_game_result(pgn)
         info = extract_opening_info(pgn)
-        n_moves = count_moves_pgn(pgn)
+        n_moves = full_moves(count_moves_pgn(pgn))
         n_moves_str = str(n_moves) if n_moves else "?"
         opening = info.get("opening") or info.get("eco") or "неизвестно"
         first_moves = " ".join(info.get("first_moves", [])[:6])
@@ -2484,7 +2586,13 @@ async def send_women_round_summary(bot: Bot, round_name: str, games_pgn: list[st
         results_for_claude.append(
             f"• {w} (белые) vs {b} (чёрные): {res}, {n_moves_str} ходов. "
             + (f"Причина ничьей: {draw_reason}. " if draw_reason else "")
+            + ("(Повторение позиции не «предлагают» — пиши «ничья повторением "
+               "ходов» или «вечный шах».) "
+               if draw_reason and "повторение" in draw_reason else "")
             + f"Дебют: {opening}. Первые ходы: {first_moves}.{tp_info}"
+            + (f" Концовка партии (последние ходы): {game_ending_san(pgn)}. "
+               f"Опиши, чем закончилась партия, по этим ходам — не выдумывай."
+               if game_ending_san(pgn) else "")
         )
 
     try:
@@ -3871,6 +3979,11 @@ async def monitoring_loop(bot: Bot):
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
+# Через сколько часов после старта тура доигранный тур считается «итоги уже
+# отправлены» при рестарте контейнера. Классическая партия длится до ~7 часов.
+AMNESTY_FINISHED_AFTER_HOURS = 8
+
+
 async def _amnesty_past_rounds() -> None:
     """Амнистия УЖЕ ЗАВЕРШЁННЫХ раундов при старте контейнера.
 
@@ -3954,9 +4067,21 @@ async def _amnesty_past_rounds() -> None:
                     # пропущенные итоги, если вчера сетевой сбой их съел.
                     is_recent = round_date >= yesterday_utc   # вчера или сегодня
 
+                    # Свежий, но давно доигранный тур: со старта прошло больше
+                    # AMNESTY_FINISHED_AFTER_HOURS, все партии закрыты — итоги
+                    # почти наверняка уже ушли, рестарт не должен слать дубль
+                    # (25.11.2026: деплой в 12:51 UTC повторил итоги Game 1,
+                    # сыгранной накануне). Окно после старта оставляем, чтобы
+                    # итоги, потерянные из-за сбоя, дошли после быстрого рестарта.
+                    stale_finished = (
+                        all_finished and sched_dt is not None
+                        and datetime.datetime.now(_UTC) > sched_dt + datetime.timedelta(
+                            hours=AMNESTY_FINISHED_AFTER_HOURS)
+                    )
+
                     announced.add(rid)
                     pre_announced.add(rname)
-                    if not is_recent:
+                    if not is_recent or stale_finished:
                         summary_done.add(rid)
                     # Завершённые партии этого раунда → games_over_sent
                     for pgn in pgns:
@@ -3970,7 +4095,9 @@ async def _amnesty_past_rounds() -> None:
                     if is_recent:
                         state_str = ("сегодня" if round_date == today_utc
                                      else "вчера")
-                        if all_finished:
+                        if stale_finished:
+                            state_str += " (доигран давно — round_summary НЕ повторяем)"
+                        elif all_finished:
                             state_str += " (доигран — round_summary возможен)"
                         else:
                             state_str += " (идёт)"
