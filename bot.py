@@ -1117,7 +1117,8 @@ def _trim_to_sentence(text: str) -> str:
 def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
                       clock_info: dict | None = None,
                       eval_history: list | None = None,
-                      opening_info: dict | None = None) -> str:
+                      opening_info: dict | None = None,
+                      draw_reason: str | None = None) -> str:
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
     white = game_data["white"]["username"]
     black = game_data["black"]["username"]
@@ -1169,6 +1170,12 @@ def get_gm_commentary(game_data: dict, eval_data: dict, event_type: str,
                 history_note += f"\nИнтересно: у белых было преимущество, но выиграли чёрные — произошёл перелом!"
             if min_ev <= -1.5 and result_str == "1-0":
                 history_note += f"\nИнтересно: у чёрных было преимущество, но выиграли белые — произошёл перелом!"
+
+        # Причина ничьей (см. get_draw_reason) — чтобы Claude не гадал,
+        # было это повторение, пат или мирное соглашение.
+        if event_type == "game_over" and result_str == "1/2-1/2" and draw_reason:
+            history_note += (f"\nПричина ничьей: {draw_reason}. "
+                             f"Назови её именно так, не выдумывай другую.")
 
         system, user = build_prompt(event_type,
             white=white, black=black,
@@ -1385,6 +1392,50 @@ def is_game_finished(pgn_text: str) -> bool:
     return bool(m) and m.group(1) in ("1-0", "0-1", "1/2-1/2")
 
 
+def get_draw_reason(pgn_text: str) -> str | None:
+    """Причина ничьей по PGN — или None, если партия не ничья / PGN не читается.
+
+    Проигрываем все ходы на доске и смотрим на финальную позицию:
+      • троекратное повторение → «троекратное повторение позиции (инициатор — X)»
+      • пат / недостаточный материал / правило 50 ходов
+      • ничего из этого → «соглашение сторон»
+
+    Инициатор повторения — тот, чья очередь хода в финальной позиции: по
+    правилам ФИДЕ (ст. 9.2) ничью требует именно игрок, за которым ход —
+    когда позиция уже возникла в третий раз либо возникнет после его хода.
+    Игрок, СДЕЛАВШИЙ ход с третьим повторением, заявить её не может, поэтому
+    «чей ход создал повторение» дало бы обратный ответ (Game 1 ЧМ-2026:
+    третье повторение возникло после хода Гукеша, требовал ничью Синдаров).
+
+    Формулировка «инициатор — X» нейтральна по роду: функция не знает,
+    мужчина это или женщина, а турниры бывают смешанными.
+    """
+    if get_game_result(pgn_text) != "1/2-1/2":
+        return None
+    try:
+        game = chess.pgn.read_game(io.StringIO(pgn_text))
+        if game is None:
+            return None
+        board = game.board()
+        for move in game.mainline_moves():
+            board.push(move)
+    except Exception as e:
+        print(f"get_draw_reason error: {e}")
+        return None
+
+    if board.is_repetition(3) or board.can_claim_threefold_repetition():
+        gd = pgn_to_game_data(pgn_text)
+        side = "white" if board.turn == chess.WHITE else "black"
+        return f"троекратное повторение позиции (инициатор — {gd[side]['username']})"
+    if board.is_stalemate():
+        return "пат"
+    if board.is_insufficient_material():
+        return "недостаточный материал"
+    if board.can_claim_fifty_moves():
+        return "правило 50 ходов"
+    return "соглашение сторон"
+
+
 def is_walkover_game(pgn_text: str) -> bool:
     """Партия — форфит снявшегося игрока.
 
@@ -1472,6 +1523,10 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
             result_line = f"⚫️ 0-1 *{w} – {b}* ({n_moves_str} ходов)"
         else:
             result_line = f"🤝 ½-½ *{w} – {b}* ({n_moves_str} ходов)"
+        # Причина ничьей: в строку результата и в контекст для Claude.
+        draw_reason = get_draw_reason(pgn)
+        if draw_reason:
+            result_line += f" — {draw_reason}"
         results_lines.append(result_line)
 
         # Переломные моменты — описываем по-человечески
@@ -1531,7 +1586,8 @@ async def send_round_summary(bot: Bot, round_name: str, games_pgn: list[str]):
 
         results_for_claude.append(
             f"• {w} (белые) vs {b} (чёрные): {res}, {n_moves_str} ходов. "
-            f"Дебют: {opening}. Первые ходы: {first_moves}.{tp_info}"
+            + (f"Причина ничьей: {draw_reason}. " if draw_reason else "")
+            + f"Дебют: {opening}. Первые ходы: {first_moves}.{tp_info}"
         )
 
     # Таблица очков для контекста
@@ -1859,7 +1915,8 @@ async def send_15min_status(bot: Bot, game_data: dict, pgn: str):
 
 def format_event_msg(game_data: dict, eval_data: dict, event_type: str,
                      commentary: str, clock_info: dict | None = None,
-                     women: bool = False) -> str:
+                     women: bool = False,
+                     draw_reason: str | None = None) -> str:
     w = game_data["white"]["username"]
     b = game_data["black"]["username"]
     icons = {"eval_swing": "📈", "eval_swing_missed": "😱", "game_over": "🏁", "new_game": "♟️"}
@@ -1887,6 +1944,8 @@ def format_event_msg(game_data: dict, eval_data: dict, event_type: str,
                         "1/2-1/2": "🤝 ½-½"}.get(res, "")
         if result_emoji:
             result_line = f"\n{result_emoji}"
+            if res == "1/2-1/2" and draw_reason:
+                result_line += f" — {draw_reason}"
 
     return (f"{icons.get(event_type,'♟️')} *{w} — {b}*{result_line}\n"
             f"Ход {eval_data['move_count']} | Оценка: `{eval_data['eval_str']}` | "
@@ -2374,6 +2433,10 @@ async def send_women_round_summary(bot: Bot, round_name: str, games_pgn: list[st
             result_line = f"⚫️ 0-1 *{w} – {b}* ({n_moves_str} ходов)"
         else:
             result_line = f"🤝 ½-½ *{w} – {b}* ({n_moves_str} ходов)"
+        # Причина ничьей: в строку результата и в контекст для Claude.
+        draw_reason = get_draw_reason(pgn)
+        if draw_reason:
+            result_line += f" — {draw_reason}"
         results_lines.append(result_line)
 
         tps = await loop.run_in_executor(None, find_turning_points, pgn)
@@ -2420,7 +2483,8 @@ async def send_women_round_summary(bot: Bot, round_name: str, games_pgn: list[st
 
         results_for_claude.append(
             f"• {w} (белые) vs {b} (чёрные): {res}, {n_moves_str} ходов. "
-            f"Дебют: {opening}. Первые ходы: {first_moves}.{tp_info}"
+            + (f"Причина ничьей: {draw_reason}. " if draw_reason else "")
+            + f"Дебют: {opening}. Первые ходы: {first_moves}.{tp_info}"
         )
 
     try:
@@ -3509,9 +3573,12 @@ async def women_monitoring_step(bot: Bot, now: float):
                 clock_info = analyze_clocks(pgn)
                 hist = w_games_eval_history.get(game_id)
                 op_info = extract_opening_info(pgn)
+                draw_reason = get_draw_reason(pgn) if event_type == "game_over" else None
                 commentary = get_gm_commentary(game_data, eval_data, event_type, clock_info,
-                                               eval_history=hist, opening_info=op_info)
-                msg = format_event_msg(game_data, eval_data, event_type, commentary, clock_info, women=True)
+                                               eval_history=hist, opening_info=op_info,
+                                               draw_reason=draw_reason)
+                msg = format_event_msg(game_data, eval_data, event_type, commentary, clock_info,
+                                       women=True, draw_reason=draw_reason)
                 msg = "♛ " + msg   # метка женского турнира
                 await send_update_with_photo(bot, msg, pgn)
                 w_games_baseline_eval[game_id] = eval_data
@@ -3722,9 +3789,12 @@ async def monitoring_loop(bot: Bot):
                     clock_info = analyze_clocks(pgn)
                     hist = games_eval_history.get(game_id)
                     op_info = extract_opening_info(pgn)
+                    draw_reason = get_draw_reason(pgn) if event_type == "game_over" else None
                     commentary = get_gm_commentary(game_data, eval_data, event_type, clock_info,
-                                                   eval_history=hist, opening_info=op_info)
-                    msg = format_event_msg(game_data, eval_data, event_type, commentary, clock_info)
+                                                   eval_history=hist, opening_info=op_info,
+                                                   draw_reason=draw_reason)
+                    msg = format_event_msg(game_data, eval_data, event_type, commentary, clock_info,
+                                           draw_reason=draw_reason)
                     await send_update_with_photo(bot, msg, pgn)
                 if event_type:
                     # Обновляем базовую линию при любом событии (даже если не отправляли)
