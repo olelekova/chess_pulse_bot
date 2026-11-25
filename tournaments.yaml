@@ -74,6 +74,11 @@ algorithm_catalog:
     title: "Финальные места (1, 2, 3...)"
     when:  "только в итогах последнего тура"
     why:   "победитель + распределение мест с тай-брейками"
+  commentary_digest:
+    title: "Обзор комментариев о партии"
+    when:  "утром после игрового дня (params.commentary_digest_hour_utc)"
+    why:   "что сказали игроки и известные гроссмейстеры — пересказ со ссылками"
+    params: [commentary_digest_hour_utc, commentary_digest_sources]
   game_over_post:
     title: "Пост на окончание партии"
     when:  "сразу как партия завершилась"
@@ -791,9 +796,11 @@ tournaments:
       game_over_post:              false   # перекрывается round_summary (1 партия)
       final_standings_with_places: true    # сработает на Game 14 (если матч дошёл)
       hourly_recap:                false
+      commentary_digest:           true    # утром после партии: что о ней говорили
 
     params:
       round_start_utc:     "14:00"         # 15:00 Женева CET / 17:00 МСК
+      commentary_digest_hour_utc: 9        # 10:00 Женева / 12:00 МСК, на следующий день
       pulse_intervals:     [3600, 7200, 10800]  # 1ч / 2ч / 3ч — матч, не круговой
       eval_swing_threshold: 1.2
       novelty_move_threshold: 15

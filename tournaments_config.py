@@ -58,6 +58,7 @@ KNOWN_ALGORITHMS = {
     "hourly_recap",
     "daily_digest",   # secondary-турниры: один пост в день со всеми результатами
     "upset_analysis", # bracket-турниры: подробный разбор сенсационных матчей
+    "commentary_digest",  # утром после игрового дня: что говорили о партии
 }
 
 REQUIRED_FIELDS = {
