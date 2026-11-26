@@ -102,7 +102,35 @@ def get_position_analysis(fen: str, white: str = "", black: str = "") -> str:
             return report
         except Exception as e:
             print(f"[commentary_prompts] full_analysis error: {e}")
-    return ""
+    return _basic_position_report(fen, white, black)
+
+
+def _basic_position_report(fen: str, white: str = "", black: str = "") -> str:
+    """Расстановка фигур по сторонам из FEN — чтобы Claude не гадал, чья
+    фигура на каком поле. Используется, когда analyze_position.py нет."""
+    try:
+        import chess
+        board = chess.Board(fen)
+    except Exception:
+        return ""
+    letters = {chess.KING: "Кр", chess.QUEEN: "Ф", chess.ROOK: "Л",
+               chess.BISHOP: "С", chess.KNIGHT: "К"}
+
+    def side(color: bool) -> str:
+        parts = []
+        for pt in (chess.KING, chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT):
+            parts += [letters[pt] + chess.square_name(sq)
+                      for sq in sorted(board.pieces(pt, color))]
+        pawns = " ".join(chess.square_name(sq)
+                         for sq in sorted(board.pieces(chess.PAWN, color)))
+        return ", ".join(parts) + (f"; пешки: {pawns}" if pawns else "")
+
+    w = f"Белые ({white})" if white else "Белые"
+    b = f"Чёрные ({black})" if black else "Чёрные"
+    to_move = w if board.turn == chess.WHITE else b
+    return (f"{w}: {side(chess.WHITE)}\n"
+            f"{b}: {side(chess.BLACK)}\n"
+            f"Очередь хода: {to_move}")
 
 
 # ===================================================================
@@ -131,7 +159,7 @@ def build_pulse_prompt(
 Ход: {move_count} | Оценка: {eval_str}
 Часы: {white} — {clock_white}, {black} — {clock_black}
 {time_note}
-Последние ходы: {moves}
+Последние ходы (запись «15.Be3» — ход белых, «15...Qc4» — ход чёрных): {moves}
 {pos_block}
 Напиши ровно 2 предложения: что сейчас происходит на доске и кто выглядит лучше. Покажи позицию глазами игрока — что бы ты чувствовал за доской."""
 
@@ -233,7 +261,7 @@ def build_eval_swing_prompt(
 
     user = f"""Партия: {white} (белые) – {black} (чёрные){opening_line}
 Ход: {move_count} | Лучший ход по движку: {best_move}
-Последние ходы: {moves}{time_note}
+Последние ходы (запись «15.Be3» — ход белых, «15...Qc4» — ход чёрных): {moves}{time_note}
 Событие: {event_desc}{missed_note}{history_note}
 {pos_block}
 2–3 предложения: что случилось и что ожидать дальше. Покажи момент глазами игрока — что он видел, какое решение принял и почему это важно.{result_anchor}{winning_anchor}{game_over_anchor}"""
@@ -325,7 +353,7 @@ def build_new_game_prompt(
 
     user = f"""Партия: {white} (белые) – {black} (чёрные){opening_line}
 Ход: {move_count} | Лучший ход: {best_move}
-Последние ходы: {moves}{time_note}
+Последние ходы (запись «15.Be3» — ход белых, «15...Qc4» — ход чёрных): {moves}{time_note}
 Событие: {event_desc}
 {pos_block}
 2–3 предложения: охарактеризуй дебют и чего ожидать. Что выбор дебюта говорит о намерениях игроков — кто играет на победу, кто готов к длинной борьбе."""

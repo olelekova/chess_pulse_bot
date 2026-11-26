@@ -1118,11 +1118,17 @@ def evaluate_position(pgn_text: str) -> dict | None:
         # Вычислить SAN ходов заново — game.board() даёт начальную позицию
         temp_board = game.board()
         all_san = []
+        # Каждый ход — с номером и явным цветом: «15.Be3» (белые),
+        # «15...Qc4» (чёрные). Раньше в промпт уходило «Be3, Qc4, b3» без
+        # номеров, и Claude путал, чей это ход (Game 3 ЧМ-2026: чёрного
+        # ферзя на c4 приписал белым, а уже сыгранный Be3 — чёрным).
         for m in moves:
+            prefix = (f"{temp_board.fullmove_number}." if temp_board.turn == chess.WHITE
+                      else f"{temp_board.fullmove_number}...")
             try:
-                all_san.append(temp_board.san(m))
+                all_san.append(prefix + temp_board.san(m))
             except Exception:
-                all_san.append(m.uci())
+                all_san.append(prefix + m.uci())
             temp_board.push(m)
 
         # Если партия завершена (мат/пат/сдача), Stockfish может не справиться —
@@ -1816,7 +1822,50 @@ async def get_round_preview(pairs: list[tuple[str, str]]) -> str:
     return _trim_to_sentence(r.content[0].text)
 
 
+async def _send_match_game_reminder(bot: Bot, round_name: str, games_pgn: list[str]):
+    """Матч (2 игрока): вместо «превью тура» — напоминание в две строки.
+    Пары в матче известны заранее, а общий текст «чего ждать» от Claude
+    перед каждой партией повторялся и ничего не сообщал. Оставляем только
+    то, чего читатель может не помнить: время, цвет, счёт."""
+    prof = TOURNAMENT_PROFILES.get("open", {})
+    when = ""
+    start_utc = ROUND_SCHEDULE.get(round_name)
+    if start_utc:
+        when = f" — сегодня в {start_utc.astimezone(ZoneInfo('Europe/Moscow')).strftime('%H:%M')} МСК"
+        tz, city = prof.get("local_tz", ""), prof.get("local_city", "")
+        if tz and city:
+            try:
+                when += f" ({start_utc.astimezone(ZoneInfo(tz)).strftime('%H:%M')} {city})"
+            except Exception as e:
+                print(f"[Time UX] bad local_tz {tz!r}: {e}")
+    details = []
+    if games_pgn:
+        details.append(f"Белые — {pgn_to_game_data(games_pgn[0])['white']['username']}.")
+    try:
+        points, rounds_played = await calculate_standings()
+        names = [info["ru"] for info in _main_profile["players"].values()]
+        if rounds_played > 0 and len(names) == 2:
+            def _f(x: float) -> str:
+                return str(int(x)) if x == int(x) else str(x).replace(".5", "½").replace("0½", "½")
+            a, b = names
+            details.append(f"Счёт матча: {a} {_f(points.get(a, 0.0))} — "
+                           f"{b} {_f(points.get(b, 0.0))}.")
+    except Exception as e:
+        print(f"match reminder standings error: {e}")
+    msg = f"{prof.get('emoji', '🏆')} *{round_title_ru(round_name)}*{when}"
+    if details:
+        msg += "\n" + " ".join(details)
+    await send_update(bot, msg)
+
+
 async def send_round_start(bot: Bot, round_name: str, games_pgn: list[str]):
+    # Флаг algorithms.preview: false — анонса перед туром нет вовсе.
+    if not TOURNAMENT_PROFILES.get("open", {}).get("preview", True):
+        print(f"[preview] {round_name}: выключено в профиле — анонс не отправлен")
+        return
+    if _main_profile and len(_main_profile.get("players", {})) == 2:
+        await _send_match_game_reminder(bot, round_name, games_pgn)
+        return
     today = datetime.datetime.utcnow().strftime("%-d %B %Y")
     pairs = []
     for pgn in games_pgn:
