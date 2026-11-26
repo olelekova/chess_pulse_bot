@@ -4083,6 +4083,48 @@ async def send_commentary_digest(bot: Bot, round_name: str, games_pgn: list[str]
     return True
 
 
+# ─── РАЗОВЫЕ ПОСТЫ ПО РАСПИСАНИЮ (params.scheduled_posts) ────
+# Готовый текст из tournaments.yaml уходит в канал один раз в заданное время:
+#   params:
+#     scheduled_posts:
+#       - id: "regulations"
+#         at_utc: "2026-11-27 12:00"
+#         text: |
+#           ...
+# Как и обзор комментариев, пост выходит, только если бот был запущен ДО
+# at_utc: рестарт позже не приводит к повторной отправке.
+scheduled_posts_done = set()   # id → отправлен/пропущен
+SCHEDULED_POST_WINDOW_HOURS = 3
+
+
+async def check_scheduled_posts(bot: Bot):
+    posts = ((_main_profile or {}).get("params", {}) or {}).get("scheduled_posts") or []
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    for p in posts:
+        if not isinstance(p, dict):
+            continue
+        pid, text = str(p.get("id") or ""), str(p.get("text") or "").strip()
+        if not pid or not text or pid in scheduled_posts_done:
+            continue
+        try:
+            due = datetime.datetime.strptime(str(p.get("at_utc")), "%Y-%m-%d %H:%M").replace(
+                tzinfo=datetime.timezone.utc)
+        except ValueError:
+            scheduled_posts_done.add(pid)
+            print(f"[scheduled_post] {pid}: неверный at_utc {p.get('at_utc')!r} — пропуск")
+            continue
+        if now_utc < due:
+            continue
+        scheduled_posts_done.add(pid)
+        if due <= BOT_STARTED_AT:
+            continue   # бот перезапущен после срока: уже отправлен либо пропущен
+        if now_utc > due + datetime.timedelta(hours=SCHEDULED_POST_WINDOW_HOURS):
+            print(f"[scheduled_post] {pid}: окно прошло — пропуск")
+            continue
+        await send_update(bot, text)
+        print(f"[scheduled_post] {pid}: отправлен")
+
+
 async def check_commentary_digest(bot: Bot):
     """Раз в тик: не пора ли слать обзор комментариев о вчерашней партии."""
     if not _main_profile or not TOURNAMENT_PROFILES["open"].get("commentary_digest", False):
@@ -4140,6 +4182,10 @@ async def monitoring_loop(bot: Bot):
                 await check_commentary_digest(bot)
             except Exception as _de:
                 print(f"[commentary_digest] Step error: {_de}")
+            try:
+                await check_scheduled_posts(bot)
+            except Exception as _se:
+                print(f"[scheduled_post] Step error: {_se}")
 
             # ── Bracket-турниры (EWC и т.п.) ────────────────────────
             # ВАЖНО: ДО get_active_round_id — ниже стоит `continue` при
